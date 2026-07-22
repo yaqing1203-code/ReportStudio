@@ -1,0 +1,30 @@
+# Single Postgres instance backs all three access patterns:
+#   - relational (source of truth)
+#   - Apache AGE (knowledge graph / multi-hop)
+#   - pgvector  (embeddings / semantic retrieval)
+#
+# The apache/age image ships Postgres + AGE preinstalled. We add pgvector on top
+# via the init SQL (001_extensions.sql). Everything in db/init/ runs in filename
+# order on first boot, so RLS policies (003) are in place before any data lands.
+services:
+  postgres:
+    image: apache/age:PG16_latest
+    container_name: core-engine-pg
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: core_engine
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # Runs ONCE on an empty data dir, in lexical order.
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d core_engine"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  pgdata:

@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Report Studio</title>
+<link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div id="app">
+    <!-- Sidebar -->
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-mark">RS</div>
+        <div class="brand-text">Report Studio</div>
+      </div>
+      <button id="new-chat" class="new-chat">+ New report</button>
+
+      <!-- History: past reports & chat sessions, persisted in localStorage -->
+      <div class="history">
+        <div class="history-head">
+          <span>History</span>
+          <button id="clear-history" class="history-clear" title="Clear all history">Clear</button>
+        </div>
+        <div id="history-list" class="history-list">
+          <div class="history-empty">No history yet.</div>
+        </div>
+      </div>
+
+      <div class="sidebar-spacer"></div>
+      <button id="open-settings" class="settings-btn">⚙ Settings</button>
+      <div id="engine-status" class="engine-status"></div>
+    </aside>
+
+    <!-- Main chat column -->
+    <main class="chat">
+      <div id="messages" class="messages">
+        <div class="welcome">
+          <h1>Verified Industry Reports</h1>
+          <p>
+            Ask for a report on any industry or policy topic. Every figure and
+            claim is cross-referenced across authoritative sources before it
+            reaches the page — or the agent tells you the topic is out of scope.
+          </p>
+          <div class="examples" id="examples">
+            <button>Solid-state battery supply chain</button>
+            <button>EU carbon border adjustment mechanism</button>
+            <button>Global semiconductor equipment market</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Files the user staged via the paperclip, shown as removable chips. They
+           attach to the report's document session automatically once it exists. -->
+      <div id="attach-tray" class="attach-tray hidden"></div>
+
+      <div class="composer">
+        <input type="file" id="attach-input" multiple
+               accept=".pdf,.docx,.xlsx,.csv,.txt,.md,.markdown" hidden />
+        <button id="attach-btn" class="attach-btn" title="Attach documents">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none"
+               stroke="currentColor" stroke-width="2" stroke-linecap="round"
+               stroke-linejoin="round" aria-hidden="true">
+            <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>
+          </svg>
+        </button>
+        <textarea id="topic" rows="1" placeholder="Describe the report topic…"
+                  autocomplete="off"></textarea>
+        <button id="send" class="send-btn" title="Generate report">↑</button>
+      </div>
+      <div class="composer-note" id="composer-note">
+        A brief report is generated first. Add your own documents and it automatically
+        expands into a comprehensive report combining both.
+      </div>
+    </main>
+  </div>
+
+  <!-- Settings modal -->
+  <div id="settings-overlay" class="overlay hidden">
+    <div class="modal">
+      <div class="modal-head">
+        <h2>Settings</h2>
+        <button id="close-settings" class="icon-btn">✕</button>
+      </div>
+      <div class="modal-body">
+        <section>
+          <h3>Language model</h3>
+          <label>API protocol
+            <select id="llm_provider">
+              <option value="fake">Offline demo (no API)</option>
+              <option value="anthropic">Anthropic</option>
+              <option value="openai">OpenAI-compatible</option>
+            </select>
+          </label>
+          <label>Model
+            <input id="llm_model" type="text" placeholder="claude-opus-4-8 / gpt-4o / …" />
+          </label>
+          <label id="wrap_base_url">Base URL
+            <input id="llm_base_url" type="text"
+                   placeholder="https://api.openai.com/v1 (OpenAI-compatible)" />
+          </label>
+          <label id="wrap_llm_key">API key
+            <input id="llm_api_key" type="password" placeholder="Leave blank to keep current" />
+            <span id="llm_key_state" class="key-state"></span>
+          </label>
+          <label id="wrap_anthropic_key">Anthropic API key
+            <input id="anthropic_api_key" type="password" placeholder="Leave blank to keep current" />
+            <span id="anthropic_key_state" class="key-state"></span>
+          </label>
+        </section>
+
+        <section>
+          <h3>Web search</h3>
+          <label>Search backend
+            <select id="search_provider">
+              <option value="duckduckgo">DuckDuckGo (keyless, built-in)</option>
+              <option value="tavily">Tavily (higher quality, needs key)</option>
+            </select>
+          </label>
+          <label id="wrap_search_key">Search API key
+            <input id="search_api_key" type="password" placeholder="Leave blank to keep current" />
+            <span id="search_key_state" class="key-state"></span>
+          </label>
+        </section>
+
+        <section>
+          <h3>Verification &amp; output</h3>
+          <label>Verification contract
+            <select id="verify_mode">
+              <option value="traceable">Traceable (synthesis allowed, no fabricated facts)</option>
+              <option value="strict">Strict (verbatim quote required per claim)</option>
+            </select>
+          </label>
+          <label>PDF engine
+            <select id="latex_engine">
+              <option value="auto">Auto (prefer bundled Tectonic)</option>
+              <option value="tectonic">Tectonic</option>
+              <option value="xelatex">xelatex</option>
+              <option value="pdflatex">pdflatex</option>
+            </select>
+          </label>
+        </section>
+      </div>
+      <div class="modal-foot">
+        <span id="settings-status" class="settings-status"></span>
+        <button id="save-settings" class="primary-btn">Save</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Shared hover popover for history items that have uploaded documents.
+       Positioned by JS (fixed) so it's never clipped by the scrolling sidebar. -->
+  <div id="file-tooltip" class="file-tooltip hidden" role="tooltip" aria-hidden="true"></div>
+
+  <script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,100 @@
+# ============================================================================
+#  DEFAULT ONTOLOGY  —  the ENTIRE data-layer domain adaptation lives here.
+#  Replace this file to pivot verticals. The engine has zero hard-coded types.
+#
+#  This is a PLACEHOLDER illustrating the shape. When you send your database
+#  schema, we fill `entities`, `relationships`, and especially `mappings` to
+#  project your relational tables into the Knowledge Graph — no engine changes.
+# ============================================================================
+version: 1
+name: default
+
+# ---- Entity types → become vertex labels in the KG ----
+entities:
+  - type: Document
+    label_property: title
+    searchable_properties: [title]
+    properties:
+      - {name: uri,          dtype: string,   indexed: true, required: true}
+      - {name: title,        dtype: string,   indexed: true}
+      - {name: published_at, dtype: datetime, indexed: true}
+      - {name: sensitivity,  dtype: enum, values: [public, internal, restricted]}
+
+  - type: Organization
+    label_property: name
+    searchable_properties: [name, legal_name]
+    properties:
+      - {name: uri,        dtype: string, indexed: true, required: true}
+      - {name: name,       dtype: string, indexed: true}
+      - {name: legal_name, dtype: string}
+
+  - type: Person
+    label_property: name
+    searchable_properties: [name]
+    properties:
+      - {name: uri,  dtype: string, indexed: true, required: true}
+      - {name: name, dtype: string, indexed: true}
+
+# ---- Relationship types → become edge labels. `transitive: true` opts an edge
+#      into multi-hop transitive expansion (your prioritized capability). ----
+relationships:
+  - type: AUTHORED_BY
+    from: Document
+    to: Person
+    cardinality: many_to_many
+    properties:
+      - {name: role, dtype: string}
+
+  - type: AFFILIATED_WITH
+    from: Person
+    to: Organization
+    cardinality: many_to_many
+    transitive: true
+
+  - type: REFERENCES
+    from: Document
+    to: Document
+    directed: true
+    transitive: true
+
+  - type: SUPPLIES
+    from: Organization
+    to: Organization
+    directed: true
+    transitive: true      # enables 'trace the supply chain N hops out'
+
+# ---- Structured ingestion: map YOUR relational tables → graph nodes/edges.
+#      Deterministic, no LLM. This is the section we fill from your schema. ----
+mappings:
+  - source_table: documents
+    entity_type: Document
+    primary_key: id
+    column_map:
+      id: uri
+      title: title
+      published_at: published_at
+      sensitivity: sensitivity
+    edges:
+      - {relationship_type: AUTHORED_BY, fk_column: author_id, target_entity: Person, target_key: id}
+
+  - source_table: people
+    entity_type: Person
+    primary_key: id
+    column_map:
+      id: uri
+      full_name: name
+    edges:
+      - {relationship_type: AFFILIATED_WITH, fk_column: org_id, target_entity: Organization, target_key: id}
+
+  - source_table: organizations
+    entity_type: Organization
+    primary_key: id
+    column_map:
+      id: uri
+      name: name
+      legal_name: legal_name
+
+# ---- Unstructured extraction: how to pull entities from PDFs/reports. ----
+extraction:
+  - {entity: Organization, strategy: ner_plus_llm, canonicalization_threshold: 0.88}
+  - {entity: Person,       strategy: ner_plus_llm, canonicalization_threshold: 0.90}
