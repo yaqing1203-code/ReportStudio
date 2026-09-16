@@ -12,7 +12,14 @@
 "use strict";
 
 const $ = (id) => document.getElementById(id);
-const api = (path) => path; // same origin
+// Per-launch loopback session token, injected into the window URL by the shell
+// (?token=...). The server rejects tokenless requests when a token is configured,
+// so append it to every API call (fetch, SSE, download links all route via api()).
+const SESSION_TOKEN = new URLSearchParams(location.search).get("token");
+const api = (path) => {
+  if (!SESSION_TOKEN) return path; // same origin
+  return path + (path.includes("?") ? "&" : "?") + "token=" + encodeURIComponent(SESSION_TOKEN);
+};
 
 let running = false;
 
@@ -294,7 +301,7 @@ function renderMarkdown(src) {
   let text = String(src).replace(/```[ \t]*([\w+-]*)\n?([\s\S]*?)```/g, (_, lang, code) => {
     const i = codeBlocks.length;
     codeBlocks.push(`<pre class="code-block"><code>${esc(code.replace(/\n$/, ""))}</code></pre>`);
-    return ` CODE${i} `;
+    return `@@CODE${i}@@`;
   });
 
   // 2. Escape everything else.
@@ -329,7 +336,7 @@ function renderMarkdown(src) {
       html.push(`<li>${inline(m[1])}</li>`);
     } else if (line.trim() === "") {                         // blank -> paragraph break
       closeList();
-    } else if (line.startsWith(" CODE")) {              // code-block placeholder
+    } else if (line.startsWith("@@CODE")) {              // code-block placeholder
       closeList();
       html.push(line);
     } else {                                                 // paragraph text
@@ -341,7 +348,7 @@ function renderMarkdown(src) {
 
   // 5. Restore code blocks.
   let result = html.join("\n");
-  result = result.replace(/ CODE(\d+) /g, (_, i) => codeBlocks[Number(i)] || "");
+  result = result.replace(/@@CODE(\d+)@@/g, (_, i) => codeBlocks[Number(i)] || "");
   return result;
 }
 
@@ -707,6 +714,7 @@ function streamEvents(jobId, statusEl, card, _unused, opts) {
     done = true;
     clearTimeout(watchdog);
     try { es.close(); } catch {}
+    removeConfirmationCard(card);   // a pending HITL card is moot once the run ends
     running = false;
     $("send").disabled = false;
     if (status === "completed" && data && data.has_pdf) {
@@ -738,6 +746,17 @@ function streamEvents(jobId, statusEl, card, _unused, opts) {
     if (data.heartbeat) return;
 
     if (!data.final && data.stage) {
+      // HITL checkpoint (workflow F): the pipeline is paused awaiting a human decision
+      // on isolated claims. Show the review card; the run resumes (or aborts) once the
+      // user clicks and POSTs /api/jobs/{id}/confirm.
+      if (data.stage === "awaiting_confirmation") {
+        appendStatusEvent(statusEl, data.stage, "Waiting for human confirmation…");
+        showConfirmationCard(card, jobId, data.detail);
+        return;
+      }
+      if (data.stage === "confirmation_resolved") {
+        removeConfirmationCard(card);
+      }
       appendStatusEvent(statusEl, data.stage, data.detail);
       return;
     }
@@ -816,7 +835,75 @@ function _prettyStage(base) {
     analyzing: "Synthesizing analysis",
     generating_latex: "Generating LaTeX",
     compiling: "Compiling PDF",
+    awaiting_confirmation: "Awaiting human confirmation",
+    confirmation_resolved: "Isolated-claim review",
   })[base] || base.replace(/_/g, " ");
+}
+
+// ============================ HITL confirmation card =======================
+// Rendered when the backend emits stage="awaiting_confirmation" (workflow F, gated
+// by the hitl_on_isolated_core_claim setting). `detail` is a JSON string:
+//   {"claims": [{"text": ..., "domain": ..., "credibility": ...}], "timeout_s": N}
+// The card blocks nothing client-side — the pipeline waits server-side; clicking a
+// button POSTs the decision and the SSE stream carries the run to its final event.
+function showConfirmationCard(card, jobId, detail) {
+  removeConfirmationCard(card);
+  let summary = null;
+  try { summary = JSON.parse(detail); } catch { summary = null; }
+  const claims = summary && Array.isArray(summary.claims) ? summary.claims : [];
+  const items = claims.map((c) => `
+    <li class="hitl-claim">
+      <span class="hitl-claim-text">${escapeHtml(c.text || "")}</span>
+      <span class="hitl-claim-meta">source: ${escapeHtml(c.domain || "unknown")} ·
+        credibility: ${escapeHtml(c.credibility || "ungraded")}</span>
+    </li>`).join("");
+
+  const box = document.createElement("div");
+  box.className = "hitl-card";
+  box.innerHTML = `
+    <div class="hitl-title">⚠ Human review required</div>
+    <p class="hitl-hint">The following claim(s) rest on a single source and have not
+      been independently corroborated. Decide whether the report should continue.</p>
+    <ul class="hitl-list">${items}</ul>
+    <div class="hitl-actions">
+      <button class="primary-btn hitl-continue">Continue generation</button>
+      <button class="hitl-abort">Abort report</button>
+      <span class="hitl-status"></span>
+    </div>`;
+
+  const status = box.querySelector(".hitl-status");
+  const setButtons = (disabled) =>
+    box.querySelectorAll("button").forEach((b) => { b.disabled = disabled; });
+  const send = async (decision) => {
+    setButtons(true);
+    status.textContent = decision === "continue" ? "Continuing…" : "Aborting…";
+    try {
+      const resp = await fetch(api(`/api/jobs/${jobId}/confirm`), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ decision }),
+      });
+      if (!resp.ok) {
+        const body = await resp.json().catch(() => null);
+        status.textContent = extractErrorMessage(body, resp.status);
+        setButtons(false);
+      }
+      // On success the pipeline resumes; the card closes on confirmation_resolved
+      // or the final event.
+    } catch (e) {
+      status.textContent = `Failed: ${e.message || e}`;
+      setButtons(false);
+    }
+  };
+  box.querySelector(".hitl-continue").addEventListener("click", () => send("continue"));
+  box.querySelector(".hitl-abort").addEventListener("click", () => send("abort"));
+  card.appendChild(box);
+  scrollDown();
+}
+
+function removeConfirmationCard(card) {
+  const el = card && card.querySelector(".hitl-card");
+  if (el) el.remove();
 }
 
 function markAllDone(statusEl) {

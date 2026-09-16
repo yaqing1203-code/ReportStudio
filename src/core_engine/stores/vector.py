@@ -15,8 +15,9 @@ by Reciprocal Rank Fusion in the retriever. This module exposes the two legs.
 """
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Sequence
+from typing import TYPE_CHECKING, Any
 
 from core_engine.config import get_settings
 

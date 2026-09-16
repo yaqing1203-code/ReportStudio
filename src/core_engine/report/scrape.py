@@ -11,9 +11,15 @@ The pipeline calls search(), passes the hits through the STRICT source filter
 survivors. Order matters: we never download a rejected domain.
 
 Providers:
-  - "fake"    : deterministic in-memory fixtures. Default. No network, no keys.
-  - "tavily"  : Tavily search API (needs CE_SEARCH_API_KEY).
-  - "serpapi" : SerpAPI (needs CE_SEARCH_API_KEY).
+  - "fake"       : deterministic in-memory fixtures. Default. No network, no keys.
+  - "duckduckgo" : keyless web search (zero-setup default).
+  - "tavily"     : Tavily search API (needs CE_SEARCH_API_KEY).
+  - "firecrawl"  : Firecrawl search API (needs CE_FIRECRAWL_API_KEY).
+  - "jina"       : Jina Reader search (CE_JINA_API_KEY optional).
+
+When no provider is explicitly injected and `search_router_enabled` is on, queries
+are routed per query type through report/router.py (backend fallback chains) and
+results are cached on disk via report/search_cache.py.
 
 The real fetcher honours robots.txt and a timeout; extraction strips boilerplate
 to main content so the verifier quotes real prose, not nav chrome.
@@ -26,7 +32,13 @@ from typing import Protocol
 
 from core_engine.config import get_settings
 from core_engine.report.models import SearchHit, Source, SourceKind
-from core_engine.report.sources import classify, extract_domain, filter_hits
+from core_engine.report.search_cache import SearchCache
+from core_engine.report.sources import (
+    classify,
+    credibility_for,
+    extract_domain,
+    filter_hits,
+)
 
 log = logging.getLogger(__name__)
 
@@ -113,7 +125,7 @@ class TavilySearchProvider:
             log.info("tavily search attempt %d/%d: %r (timeout=%.0fs)",
                      attempt, attempts, topic, s.search_timeout_s)
             try:
-                async with httpx.AsyncClient(timeout=s.search_timeout_s) as client:  # noqa: E501
+                async with httpx.AsyncClient(timeout=s.search_timeout_s) as client:
                     resp = await client.post(
                         "https://api.tavily.com/search",
                         json={
@@ -211,7 +223,7 @@ class DuckDuckGoSearchProvider:
         def _run() -> list[dict]:
             try:
                 try:
-                    from ddgs import DDGS            # new package name
+                    from ddgs import DDGS  # new package name
                 except ImportError:
                     from duckduckgo_search import DDGS  # legacy name
             except Exception:
@@ -267,7 +279,7 @@ class DuckDuckGoSearchProvider:
         hits: list[SearchHit] = []
         seen: set[str] = set()
         pattern = re.compile(
-            r'<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>(.*?)</a>', re.S
+            r'<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>(.*?)</a>', re.DOTALL
         )
         for m in pattern.finditer(body):
             raw_href, raw_title = m.group(1), m.group(2)
@@ -287,6 +299,136 @@ class DuckDuckGoSearchProvider:
             ))
             if len(hits) >= max_results:
                 break
+        return hits
+
+
+async def _api_search_request(
+    name: str,
+    method: str,
+    url: str,
+    *,
+    headers: dict[str, str] | None = None,
+    json_body: dict | None = None,
+):
+    """Shared retry/error-handling for the API search providers (Firecrawl, Jina).
+
+    Same policy as TavilySearchProvider: auth failures (401/403) and other 4xx are
+    permanent and raise immediately; network errors, 429 and 5xx retry with
+    exponential backoff; exhausting attempts raises SearchUnavailableError so the
+    router can fall through to the next backend.
+    """
+    import httpx
+
+    s = get_settings()
+    attempts = max(1, s.search_max_retries)
+    last_err = ""
+    for attempt in range(1, attempts + 1):
+        log.info("%s search attempt %d/%d (timeout=%.0fs)",
+                 name, attempt, attempts, s.search_timeout_s)
+        try:
+            async with httpx.AsyncClient(timeout=s.search_timeout_s) as client:
+                resp = await client.request(method, url, headers=headers, json=json_body)
+        except Exception as e:
+            # Network/timeout — transient, retry with backoff before giving up.
+            last_err = f"{type(e).__name__}: {e}"
+            log.warning("%s attempt %d failed (network): %s", name, attempt, last_err)
+            if attempt < attempts:
+                await asyncio.sleep(s.search_retry_base_s * (2 ** (attempt - 1)))
+                continue
+            raise SearchUnavailableError(
+                f"Could not reach {name} after {attempts} attempt(s): {last_err}"
+            ) from e
+
+        if resp.status_code in (401, 403):
+            raise SearchUnavailableError(
+                f"{name} rejected the API key (HTTP {resp.status_code}).")
+        if resp.status_code == 429 or resp.status_code >= 500:
+            last_err = f"HTTP {resp.status_code}: {resp.text[:200]}"
+            log.warning("%s attempt %d got %s", name, attempt, last_err)
+            if attempt < attempts:
+                await asyncio.sleep(s.search_retry_base_s * (2 ** (attempt - 1)))
+                continue
+            raise SearchUnavailableError(
+                f"{name} unavailable after {attempts} attempt(s): {last_err}")
+        if resp.status_code >= 400:
+            raise SearchUnavailableError(
+                f"{name} returned HTTP {resp.status_code}: {resp.text[:200]}")
+        return resp
+    # Unreachable (loop either returns or raises), but keeps type checkers happy.
+    raise SearchUnavailableError(f"{name} search failed: {last_err}")
+
+
+class FirecrawlSearchProvider:
+    """Firecrawl /v1/search API — search tuned for structured data extraction.
+
+    Preferred by the router for STRUCTURED queries (tables / revenue / market-size
+    figures): Firecrawl returns page content geared at downstream extraction rather
+    than bare links. Needs CE_FIRECRAWL_API_KEY; the factory raises without one, so
+    the router skips it in the fallback chain.
+    """
+
+    _ENDPOINT = "https://api.firecrawl.dev/v1/search"
+
+    def __init__(self, api_key: str) -> None:
+        self._key = api_key
+
+    async def search(self, topic: str, *, max_results: int) -> list[SearchHit]:
+        resp = await _api_search_request(
+            "firecrawl", "POST", self._ENDPOINT,
+            headers={"Authorization": f"Bearer {self._key}"},
+            json_body={"query": topic, "limit": max_results},
+        )
+        hits: list[SearchHit] = []
+        for r in resp.json().get("data", []):
+            url = r.get("url", "")
+            if not url:
+                continue
+            hits.append(SearchHit(
+                url=url,
+                title=r.get("title", ""),
+                snippet=r.get("description", ""),
+                domain=extract_domain(url),
+            ))
+        log.info("firecrawl search %r -> %d hit(s)", topic, len(hits))
+        return hits
+
+
+class JinaSearchProvider:
+    """Jina Reader search — GET https://s.jina.ai/{query} with Accept: application/json.
+
+    Works WITHOUT an API key (CE_JINA_API_KEY optional; a key just loosens the rate
+    limit), which makes it a useful router fallback for CHINESE queries where the
+    keyless DuckDuckGo endpoint is often blocked.
+    """
+
+    _ENDPOINT = "https://s.jina.ai/"
+
+    def __init__(self, api_key: str | None = None) -> None:
+        self._key = api_key or ""
+
+    async def search(self, topic: str, *, max_results: int) -> list[SearchHit]:
+        from urllib.parse import quote
+
+        headers = {"Accept": "application/json"}
+        if self._key:
+            headers["Authorization"] = f"Bearer {self._key}"
+        resp = await _api_search_request(
+            "jina", "GET", self._ENDPOINT + quote(topic, safe=""), headers=headers,
+        )
+        data = resp.json()
+        rows = data.get("data", data if isinstance(data, list) else [])
+        hits: list[SearchHit] = []
+        for r in rows[:max_results]:
+            url = r.get("url", "")
+            if not url:
+                continue
+            hits.append(SearchHit(
+                url=url,
+                title=r.get("title", ""),
+                snippet=r.get("description", "") or r.get("content", "")[:300],
+                domain=extract_domain(url),
+            ))
+        log.info("jina search %r -> %d hit(s)", topic, len(hits))
         return hits
 
 
@@ -315,14 +457,17 @@ class HttpFetcher:
         rp = RobotFileParser()
         try:
             # Short, dedicated timeout: a slow/absent robots.txt must not double the
-            # per-page latency. If we can't read it quickly, we permit (and still
-            # rate-limit via the page fetch's own timeout).
+            # per-page latency. If we can't read it quickly, the fail-open/fail-closed
+            # policy (scrape_robots_fail_open) decides; fetches are still rate-limited
+            # via the page fetch's own timeout.
             resp = await client.get(f"{root}/robots.txt",
                                     timeout=self._s.robots_timeout_s)
             rp.parse(resp.text.splitlines())
             ok = rp.can_fetch(self._s.scrape_user_agent, url)
         except Exception:
-            ok = True  # no robots.txt reachable -> permit, but still rate-limited
+            # No robots.txt reachable -> permit or skip per scrape_robots_fail_open
+            # (either way the page fetch itself is still rate-limited).
+            ok = self._s.scrape_robots_fail_open
         self._robots_cache[root] = ok
         return ok
 
@@ -332,7 +477,7 @@ class HttpFetcher:
         try:
             return await asyncio.wait_for(
                 self._fetch_inner(url), timeout=self._s.scrape_per_url_timeout_s)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             log.warning("fetch timed out (>%.0fs) for %s — skipping",
                         self._s.scrape_per_url_timeout_s, url)
             return None
@@ -383,17 +528,28 @@ def _extract_main_text(html: str) -> str:
 # --------------------------------------------------------------------------
 # Factory + orchestration
 # --------------------------------------------------------------------------
-def get_search_provider() -> SearchProvider:
+def get_search_provider(name: str | None = None) -> SearchProvider:
+    """Instantiate a search backend. With `name=None` (default) the configured
+    `settings.search_provider` is used — the historical behavior. With an explicit
+    name the router instantiates chain backends by name; a backend whose required
+    key is missing raises, so the router skips it and tries the next chain entry."""
     s = get_settings()
-    if s.search_provider == "duckduckgo":
+    chosen = name or s.search_provider
+    if chosen == "duckduckgo":
         return DuckDuckGoSearchProvider()          # keyless, zero-setup default
-    if s.search_provider == "tavily":
+    if chosen == "tavily":
         if not s.search_api_key:
             raise RuntimeError("CE_SEARCH_API_KEY required for tavily provider")
         return TavilySearchProvider(s.search_api_key)
-    if s.search_provider == "fake":
+    if chosen == "firecrawl":
+        if not s.firecrawl_api_key:
+            raise RuntimeError("CE_FIRECRAWL_API_KEY required for firecrawl provider")
+        return FirecrawlSearchProvider(s.firecrawl_api_key)
+    if chosen == "jina":
+        return JinaSearchProvider(s.jina_api_key or None)   # key optional
+    if chosen == "fake":
         return FakeSearchProvider()
-    raise RuntimeError(f"Unknown search_provider: {s.search_provider}")
+    raise RuntimeError(f"Unknown search provider: {chosen}")
 
 
 def get_fetcher() -> Fetcher:
@@ -552,12 +708,37 @@ def relevance_score(topic: str, body: str) -> tuple[float, int]:
     return density, distinct
 
 
+def _backend_name(provider) -> str:
+    """Stable cache-key name for a provider instance ('tavily', 'duckduckgo', ...)."""
+    return type(provider).__name__.lower().removesuffix("searchprovider")
+
+
+def _freshness_score(fetched_at: str) -> float:
+    """exp(-age in years) of the fetch timestamp; 0.5 (neutral) if unparseable.
+
+    fetched_at is the time WE fetched the page (publication dates are not reliably
+    extractable), so freshly gathered sources all score ~1.0; the term matters for
+    cached/older Source objects entering the pool."""
+    import math
+    from datetime import UTC, datetime
+
+    try:
+        ts = datetime.fromisoformat(fetched_at)
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=UTC)
+        age_years = max(0.0, (datetime.now(UTC) - ts).total_seconds() / 86400.0 / 365.25)
+        return math.exp(-age_years)
+    except Exception:
+        return 0.5
+
+
 async def gather_sources(
     topic: str,
-    provider: SearchProvider,
+    provider: SearchProvider | None,
     fetcher: Fetcher,
     *,
     on_progress=None,
+    llm=None,
 ) -> tuple[list[Source], list[SearchHit]]:
     """Full gather step: search -> STRICT filter -> fetch survivors -> extract.
 
@@ -566,6 +747,18 @@ async def gather_sources(
     own research to draw on rather than starving on a single generic search. Hits are
     deduped by URL across sub-queries; the global fetch cap (`scrape_max_pages`) still
     bounds total downloads.
+
+    SEARCH ROUTING: when `provider` is None and `search_router_enabled` is on, each
+    query goes through report/router.py (query-type classification + per-type backend
+    fallback chain). An explicitly-passed provider always takes the single-backend
+    path, byte-for-byte the historical behavior (this is how tests pin the fake).
+    Results are cached on disk (SearchCache, keyed by backend+query) for the real
+    builtin backends; fake/custom providers bypass the cache.
+
+    RANKING: after the relevance filter, kept sources are ordered by the
+    credibility-weighted score (relevance * rank_w_relevance + credibility.weight *
+    rank_w_source + freshness * rank_w_freshness) so a weak (L4) source cannot
+    outrank L1/L2 anchors in the downstream context.
 
     PERFORMANCE / STABILITY: searches run CONCURRENTLY, and fetches run CONCURRENTLY
     under a bounded semaphore (`scrape_concurrency`). Every fetch has a hard per-URL
@@ -578,6 +771,19 @@ async def gather_sources(
     """
     s = get_settings()
     queries = build_research_queries(topic) if s.multi_query_research else [topic]
+
+    # Router mode only when the caller did NOT pin a provider. With routing off and
+    # no provider given, fall back to the configured single provider.
+    use_router = provider is None and s.search_router_enabled
+    if provider is None and not use_router:
+        provider = get_search_provider()
+    # The disk cache is an optimization for the real networked backends; fakes and
+    # custom test providers bypass it so tests never touch the user data dir.
+    cacheable = provider is not None and isinstance(
+        provider, (TavilySearchProvider, DuckDuckGoSearchProvider,
+                   FirecrawlSearchProvider, JinaSearchProvider))
+    cache = SearchCache() if (s.search_cache_ttl_s > 0 and (use_router or cacheable)) else None
+    backend_name = _backend_name(provider) if provider is not None else ""
 
     def _emit(done: int, total: int, detail: str) -> None:
         if on_progress:
@@ -595,7 +801,24 @@ async def gather_sources(
 
     async def _one_search(q: str):
         try:
-            return q, await provider.search(q, max_results=s.scrape_max_results), None
+            if use_router:
+                # Lazy import: router.py imports this module (factory), so importing
+                # it here avoids a module-level cycle.
+                from core_engine.report.router import routed_search
+
+                hits = await routed_search(
+                    q, llm, max_results=s.scrape_max_results, cache=cache,
+                    on_progress=lambda msg: _emit(0, 0, msg))
+                return q, hits, None
+            if cache is not None:
+                cached = cache.get(backend_name, q)
+                if cached is not None:
+                    log.info("gather: cache hit for %r via %s", q, backend_name)
+                    return q, cached, None
+            hits = await provider.search(q, max_results=s.scrape_max_results)
+            if cache is not None and hits:
+                cache.put(backend_name, q, hits)
+            return q, hits, None
         except SearchUnavailableError:
             raise  # hard failure — let it propagate (bad key / blocked backend)
         except (AttributeError, NameError, TypeError, KeyError, ImportError):
@@ -657,7 +880,7 @@ async def gather_sources(
             try:
                 text = await asyncio.wait_for(
                     fetcher.fetch(hit.url), timeout=fetch_budget)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 log.warning("gather: fetch exceeded %.0fs for %s — skipping",
                             fetch_budget, hit.url)
                 text = None
@@ -667,6 +890,7 @@ async def gather_sources(
         return hit, text
 
     tasks = [asyncio.create_task(_fetch_one(h)) for h in to_fetch]
+    densities: dict[str, float] = {}   # url -> relevance density (for ranking below)
     for coro in asyncio.as_completed(tasks):
         hit, text = await coro
         done += 1
@@ -688,10 +912,26 @@ async def gather_sources(
                 rejected.append(hit)
                 dropped_irrelevant += 1
                 continue
+            densities[hit.url] = density
         sources.append(Source(
             url=hit.url, domain=extract_domain(hit.url), title=hit.title,
             kind=kind, text=text,
+            credibility=credibility_for(hit.url, kind),
         ))
+
+    # CREDIBILITY-WEIGHTED RANKING: order the kept sources by
+    #   relevance * rank_w_relevance + credibility.weight * rank_w_source
+    #   + freshness * rank_w_freshness
+    # (stable sort; density 0.0 when the relevance filter is off). A high-relevance
+    # but weak-trust (L4) source can no longer outrank L1/L2 anchors, and the
+    # scrape_max_pages cap is applied on the RANKED list.
+    def _rank_score(src: Source) -> float:
+        return (densities.get(src.url, 0.0) * s.rank_w_relevance
+                + src.credibility.weight * s.rank_w_source
+                + _freshness_score(src.fetched_at) * s.rank_w_freshness)
+
+    sources.sort(key=_rank_score, reverse=True)
+    sources = sources[: s.scrape_max_pages]
     log.info("gather: %d queries -> %d source(s) kept, %d rejected "
              "(%d thin, %d irrelevant)",
              len(queries), len(sources), len(rejected), dropped_thin, dropped_irrelevant)

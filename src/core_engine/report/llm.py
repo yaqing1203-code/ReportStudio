@@ -87,6 +87,14 @@ def _retry_after_seconds(exc: Exception) -> float | None:
 class ExtractedClaim:
     text: str
     candidate_source_urls: list[str]
+    # Optional structured slots (entity-attribute-value dual-track output). The
+    # extraction prompt asks for them; any slot the model cannot fill stays None and
+    # the claim degrades to a plain-text statement downstream.
+    entity: str | None = None
+    attribute: str | None = None
+    value: str | None = None
+    qualifier: str | None = None
+    time_scope: str | None = None
 
 
 @dataclass(slots=True)
@@ -183,14 +191,16 @@ class LLM(Protocol):
     async def check_entailment(self, claim: str, source_text: str) -> EntailmentJudgement: ...
     async def check_traceability(self, claim: str, source_text: str) -> TraceJudgement: ...
     async def check_contradiction(self, claim_a: str, claim_b: str) -> ContradictionJudgement: ...
-    async def draft_section(self, heading: str, claims: list[str]) -> str: ...
+    async def draft_section(
+        self, heading: str, claims: list[str], instructions: str = ""
+    ) -> str: ...
     async def propose_outline(self, topic: str, claims: list[str]) -> list[str]: ...
     async def extract_kg(
         self, topic: str, verified_claims: list[tuple[str, str]]
-    ) -> "KGExtraction": ...
+    ) -> KGExtraction: ...
     async def identify_insights(
         self, topic: str, verified_claims: list[tuple[str, str]]
-    ) -> list["InsightCandidate"]: ...
+    ) -> list[InsightCandidate]: ...
     async def draft_deep_dive(
         self, title: str, kind: str, claims: list[str]
     ) -> list[str]: ...
@@ -203,15 +213,43 @@ class FakeLLM:
     """Rule-based stand-in. Extraction splits sentences; entailment is a literal
     substring/overlap check (so it behaves like a strict grounding oracle);
     drafting concatenates claim text. No creativity — which is exactly what we
-    want when testing the GATE rather than the prose quality."""
+    want when testing the GATE rather than the prose quality.
+
+    Test extension points (offline determinism):
+      - set_structured_claims(url, items): pin the exact ExtractedClaim list (with
+        structured slots) returned for a source URL, bypassing the rule-based extractor.
+      - set_complete(marker, response): pin the raw string returned by complete() when
+        the system prompt contains `marker` (e.g. inject an "inconsistent" verdict or a
+        fixed deviation score for the alignment layer).
+    """
+
+    def __init__(self) -> None:
+        # url -> list of ExtractedClaim | dict payload (see set_structured_claims).
+        self._structured: dict[str, list] = {}
+        # (marker substring of the system prompt) -> raw response for complete().
+        self._complete_overrides: dict[str, str] = {}
+
+    def set_structured_claims(self, source_url: str, items: list) -> None:
+        """Pin the structured extraction output for one source URL. Items may be
+        ExtractedClaim objects or dicts with text/entity/attribute/value/qualifier/
+        time_scope keys (missing slots default to None)."""
+        self._structured[source_url] = list(items)
+
+    def set_complete(self, marker: str, response: str) -> None:
+        """Pin complete()'s raw response whenever the system prompt contains `marker`."""
+        self._complete_overrides[marker] = response
 
     async def complete(self, system: str, user: str) -> str:
-        """Deterministic offline completion for the chat/intent layer.
+        """Deterministic offline completion.
 
-        Recognizes the intent-classifier system prompt and returns valid JSON so the
-        dual-mode router works with the fake provider (report keywords -> report,
-        otherwise chat). For a plain chat prompt, echoes a canned assistant reply.
+        Test-injected overrides win first. Then the intent-classifier prompt and the
+        alignment-layer prompts (entity normalization, consistency, deviation, source
+        note, query generation) get safe rule-based defaults so the aligned verify
+        strategy runs fully offline. For a plain chat prompt, echoes a canned reply.
         """
+        for marker, response in self._complete_overrides.items():
+            if marker in system:
+                return response
         sys_l = system.lower()
         if "intent classifier" in sys_l or "report_generation" in sys_l:
             u = user.lower()
@@ -225,18 +263,55 @@ class FakeLLM:
                 "confidence": "high",
                 "reasoning": f"[fake] matched={is_report}",
             })
+        # Alignment-layer defaults (verify_strategy="aligned"). Fail-open and neutral:
+        # identity alias map, consistent, zero deviation, canned note, no queries.
+        if "entity alias normalizer" in sys_l:
+            try:
+                payload = json.loads(user)
+                names = payload.get("entities", []) if isinstance(payload, dict) else []
+            except Exception:
+                names = []
+            return json.dumps({"mapping": {str(n): str(n) for n in names}})
+        if "internal consistency reviewer" in sys_l:
+            return json.dumps({"consistent": True, "note": "[fake] consistent"})
+        if "deviation assessor" in sys_l:
+            return json.dumps({"deviation": 0.0, "note": "[fake] within baseline"})
+        if "source note writer" in sys_l:
+            return "[fake] single-source note: provenance recorded, timeliness assumed."
+        if "verification query generator" in sys_l:
+            return "[]"
         # Plain chat fallback.
         return ("This is the offline demo assistant. Configure an Anthropic or "
                 "OpenAI-compatible provider in Settings for real answers.")
 
     async def extract_claims(self, source_url: str, text: str) -> list[ExtractedClaim]:
+        if source_url in self._structured:
+            out: list[ExtractedClaim] = []
+            for it in self._structured[source_url]:
+                if isinstance(it, ExtractedClaim):
+                    if not it.candidate_source_urls:
+                        it.candidate_source_urls.append(source_url)
+                    out.append(it)
+                elif isinstance(it, dict) and it.get("text"):
+                    out.append(ExtractedClaim(
+                        text=str(it["text"]),
+                        candidate_source_urls=[source_url],
+                        entity=_slot(it.get("entity")),
+                        attribute=_slot(it.get("attribute")),
+                        value=_slot(it.get("value")),
+                        qualifier=_slot(it.get("qualifier")),
+                        time_scope=_slot(it.get("time_scope")),
+                    ))
+            return out
         sentences = _split_sentences(text)
         claims: list[ExtractedClaim] = []
         for sent in sentences:
             # Only treat sentences with a factual shape (a number, %, date, or
             # a 'is/are/was/were/reported') as claims — keeps noise down.
             if _looks_factual(sent):
-                claims.append(ExtractedClaim(text=sent, candidate_source_urls=[source_url]))
+                slots = _extract_slots(sent)
+                claims.append(ExtractedClaim(
+                    text=sent, candidate_source_urls=[source_url], **slots))
         return claims
 
     async def check_entailment(self, claim: str, source_text: str) -> EntailmentJudgement:
@@ -285,9 +360,14 @@ class FakeLLM:
         # Deterministic 3-section skeleton.
         return ["Overview", "Key Findings", "Details and Data"]
 
-    async def draft_section(self, heading: str, claims: list[str]) -> str:
+    async def draft_section(
+        self, heading: str, claims: list[str], instructions: str = ""
+    ) -> str:
         # Concatenate verified claims into multi-paragraph prose (two sentences per
-        # paragraph, roughly). No new facts introduced.
+        # paragraph, roughly). No new facts introduced. Hedging markers such as
+        # "[UNVERIFIED - single source]" are part of the claim text and are preserved
+        # verbatim in the output so tests can assert on them. `instructions` is a
+        # real-LLM-only prompt refinement; the fake stays purely deterministic.
         if not claims:
             return ""
         paras = []
@@ -298,7 +378,7 @@ class FakeLLM:
 
     async def extract_kg(
         self, topic: str, verified_claims: list[tuple[str, str]]
-    ) -> "KGExtraction":
+    ) -> KGExtraction:
         # Deterministic, rule-based extraction from verified-claim text. Recognizes
         # simple structured markers so tests/fixtures can drive the chart sections
         # without a real LLM:
@@ -314,31 +394,31 @@ class FakeLLM:
 
         for cid, text in verified_claims:
             for tier in ("upstream", "midstream", "downstream"):
-                m = re.search(rf"\b{tier}\s*[:\-]\s*([A-Za-z0-9 &/]+)", text, re.I)
+                m = re.search(rf"\b{tier}\s*[:\-]\s*([A-Za-z0-9 &/]+)", text, re.IGNORECASE)
                 if m:
                     chain.append({"name": m.group(1).strip(), "tier": tier,
                                   "claim_ids": [cid]})
-            m = re.search(r"([A-Za-z0-9 &/]+?)\s+supplies\s+([A-Za-z0-9 &/]+)", text, re.I)
+            m = re.search(r"([A-Za-z0-9 &/]+?)\s+supplies\s+([A-Za-z0-9 &/]+)", text, re.IGNORECASE)
             if m:
                 chain_edges.append({"src": m.group(1).strip(), "dst": m.group(2).strip(),
                                     "label": "supplies", "claim_ids": [cid]})
             for key in ("tam", "sam", "som"):
                 m = re.search(rf"\b{key}\b\D*([\d.]+)\s*([A-Za-z$ ]*bn|[A-Za-z$ ]*billion)?",
-                              text, re.I)
+                              text, re.IGNORECASE)
                 if m:
                     market[key] = float(m.group(1))
                     market.setdefault("claim_ids", []).append(cid)
-            m = re.search(r"\bcagr\b\D*([\d.]+)\s*%", text, re.I)
+            m = re.search(r"\bcagr\b\D*([\d.]+)\s*%", text, re.IGNORECASE)
             if m:
                 market["cagr_pct"] = float(m.group(1))
                 market.setdefault("claim_ids", []).append(cid)
-            m = re.search(r"\b(19|20)\d{2}\b.*?([\d.]+)\s*(USD\s*bn|billion|bn)", text, re.I)
+            m = re.search(r"\b(19|20)\d{2}\b.*?([\d.]+)\s*(USD\s*bn|billion|bn)", text, re.IGNORECASE)
             if m:
                 year = int(re.search(r"\b((?:19|20)\d{2})\b", text).group(1))
                 market["series"].append({"year": year, "value": float(m.group(2)),
                                          "claim_ids": [cid]})
             m = re.search(r"competitor\s*[:\-]\s*([A-Za-z0-9 &/.]+?)\s+share\s+([\d.]+)\s*%"
-                          r"(?:\s+advantage\s+(.+))?", text, re.I)
+                          r"(?:\s+advantage\s+(.+))?", text, re.IGNORECASE)
             if m:
                 competitors.append({
                     "name": m.group(1).strip(),
@@ -351,7 +431,7 @@ class FakeLLM:
 
     async def identify_insights(
         self, topic: str, verified_claims: list[tuple[str, str]]
-    ) -> list["InsightCandidate"]:
+    ) -> list[InsightCandidate]:
         # Rule-based high-value-finding detection. Expanded to cover all five mandated
         # sections so the fallback per-section deep-dive coverage still leaves a
         # deterministic signal for tests. Recognizes bottlenecks, policy impacts,
@@ -510,12 +590,35 @@ class AnthropicLLM:
         system = (
             "Extract ATOMIC, checkable factual claims from the text. Each claim must "
             "be a single verifiable statement, self-contained, no opinions. Return a "
-            "JSON array of strings only."
+            "JSON array only. Each item is an object: {\"text\": <the claim>, "
+            "\"entity\": <the subject the claim is about, e.g. a company or market, or "
+            "null>, \"attribute\": <the measured property, e.g. \"market_share\" or "
+            "\"TAM\", or null>, \"value\": <the claimed value as stated, e.g. \"32%\", "
+            "or null>, \"qualifier\": <scope/calibre qualifiers such as \"GAAP\" or "
+            "\"domestic only\", or null>, \"time_scope\": <the period the claim refers "
+            "to, e.g. \"FY2023\", or null>}. Omit a slot (or set it null) whenever the "
+            "text does not state it."
         )
         raw = await self._complete(system, text[:get_settings().llm_context_chars])
         items = _safe_json_list(raw)
-        return [ExtractedClaim(text=c, candidate_source_urls=[source_url])
-                for c in items if isinstance(c, str)]
+        out: list[ExtractedClaim] = []
+        for it in items:
+            # Back-compat: a bare string item is a claim with no structured slots.
+            if isinstance(it, str):
+                out.append(ExtractedClaim(text=it, candidate_source_urls=[source_url]))
+                continue
+            if not isinstance(it, dict) or not it.get("text"):
+                continue
+            out.append(ExtractedClaim(
+                text=str(it["text"]),
+                candidate_source_urls=[source_url],
+                entity=_slot(it.get("entity")),
+                attribute=_slot(it.get("attribute")),
+                value=_slot(it.get("value")),
+                qualifier=_slot(it.get("qualifier")),
+                time_scope=_slot(it.get("time_scope")),
+            ))
+        return out
 
     async def check_entailment(self, claim: str, source_text: str) -> EntailmentJudgement:
         system = (
@@ -597,7 +700,9 @@ class AnthropicLLM:
         out = [c for c in _safe_json_list(raw) if isinstance(c, str)]
         return out or ["Overview", "Key Findings", "Details and Data"]
 
-    async def draft_section(self, heading: str, claims: list[str]) -> str:
+    async def draft_section(
+        self, heading: str, claims: list[str], instructions: str = ""
+    ) -> str:
         s = get_settings()
         system = (
             "You are a senior industry analyst writing a section of a formal research "
@@ -610,15 +715,23 @@ class AnthropicLLM:
             "figure, name, or date not present in the claims, MUST NOT speculate, and "
             "MUST NOT pad with filler to reach the length — if the verified material is "
             "limited, write a shorter but accurate section. Separate paragraphs with a "
-            "blank line. Plain text only, no headings or bullet markup."
+            "blank line. Plain text only, no headings or bullet markup.\n"
+            "HEDGING RULES (strict): any claim line marked [UNVERIFIED - single source] "
+            "rests on ONE source and has NOT been independently verified. When you draw "
+            "on it you MUST hedge explicitly (e.g. \"According to a single source, "
+            "...\", \"... has not been independently verified\") and you MUST NOT state "
+            "it as established fact. Never use categorical phrasing such as \"The data "
+            "shows\" or \"It is proven\" for such material."
         )
+        if instructions.strip():
+            system += f"\nSECTION-SPECIFIC REQUIREMENTS: {instructions.strip()}"
         raw = await self._complete(system, f"SECTION: {heading}\nVERIFIED CLAIMS:\n"
                                    + "\n".join(f"- {c}" for c in claims))
         return raw.strip()
 
     async def extract_kg(
         self, topic: str, verified_claims: list[tuple[str, str]]
-    ) -> "KGExtraction":
+    ) -> KGExtraction:
         # Structured KG extraction over VERIFIED-claim text only. Each claim is
         # passed as "[id] text" so the model can attach provenance claim_ids to
         # every element; the builder (kg.py) drops anything whose claim_ids do not
@@ -650,7 +763,7 @@ class AnthropicLLM:
 
     async def identify_insights(
         self, topic: str, verified_claims: list[tuple[str, str]]
-    ) -> list["InsightCandidate"]:
+    ) -> list[InsightCandidate]:
         # Ask the model to nominate the highest-value findings worth a deep-dive,
         # tying each to its verified claim_ids and one of the mandated sections.
         system = (
@@ -779,7 +892,7 @@ def _looks_factual(sentence: str) -> bool:
     if re.search(r"\d", sentence):
         return True
     return bool(re.search(r"\b(is|are|was|were|reported|announced|found|rose|fell|increased|decreased)\b",
-                          sentence, re.I))
+                          sentence, re.IGNORECASE))
 
 
 def _tokens(s: str) -> set[str]:
@@ -848,7 +961,7 @@ def strip_think_tags(text: str) -> str:
 
 def _safe_json_list(raw: str) -> list:
     try:
-        m = re.search(r"\[.*\]", raw, re.S)
+        m = re.search(r"\[.*\]", raw, re.DOTALL)
         return json.loads(m.group(0)) if m else []
     except Exception:
         return []
@@ -856,7 +969,79 @@ def _safe_json_list(raw: str) -> list:
 
 def _safe_json_obj(raw: str) -> dict:
     try:
-        m = re.search(r"\{.*\}", raw, re.S)
+        m = re.search(r"\{.*\}", raw, re.DOTALL)
         return json.loads(m.group(0)) if m else {}
     except Exception:
         return {}
+
+
+def _slot(v) -> str | None:
+    """Coerce an LLM-supplied slot value to a stripped string or None (missing/empty/
+    explicit null all degrade to None)."""
+    if v is None:
+        return None
+    s = str(v).strip()
+    return s or None
+
+
+def _extract_slots(sentence: str) -> dict:
+    """Rule-based structured-slot extraction for the FakeLLM dual-track output.
+
+    Recognizes a small set of deterministic shapes so offline tests exercise the
+    alignment layer without a model:
+      "COMPETITOR: <name> share 30% ..."   -> entity=name, attribute=market_share
+      "ENTITY: <name> ..."                 -> entity=name (explicit marker)
+      "<Name>'s <attr> ..."                -> entity=<Name> (possessive)
+      "TAM/SAM/SOM/CAGR is 200 USD bn"     -> attribute + value
+      "market share of 25%" / "revenue ..."-> attribute + value
+      "GAAP" / "domestic" / "global"       -> qualifier
+      a year or FYxxxx                     -> time_scope
+    Anything unrecognized stays None (the claim degrades to plain-text handling).
+    """
+    slots: dict[str, str | None] = {
+        "entity": None, "attribute": None, "value": None,
+        "qualifier": None, "time_scope": None,
+    }
+    m = re.search(r"\bcompetitor\s*[:\-]\s*([A-Za-z0-9 &/.]+?)\s+share\s+([\d.]+\s*%)",
+                  sentence, re.IGNORECASE)
+    if m:
+        slots["entity"] = m.group(1).strip()
+        slots["attribute"] = "market_share"
+        slots["value"] = m.group(2).strip()
+    else:
+        m = re.search(r"\bENTITY\s*[:\-]\s*([A-Za-z0-9 &/.]+)", sentence)
+        if m:
+            slots["entity"] = m.group(1).strip().rstrip(".")
+        else:
+            m = re.match(r"([A-Z][\w&]*(?:\s+[A-Z][\w&]*){0,3})'s\s+", sentence)
+            if m:
+                slots["entity"] = m.group(1).strip()
+        m = re.search(r"\b(TAM|SAM|SOM|CAGR)\b[^\d%]*([\d.]+\s*(?:USD\s*bn|bn|billion|%)?)",
+                      sentence, re.IGNORECASE)
+        if m:
+            slots["attribute"] = m.group(1).upper()
+            slots["value"] = m.group(2).strip() or None
+        else:
+            m = re.search(r"\b(market share|revenue|capacity)\b[^\d%]*([\d.]+\s*"
+                          r"(?:USD\s*bn|bn|billion|%|GW))?", sentence, re.IGNORECASE)
+            if m:
+                slots["attribute"] = m.group(1).lower().replace(" ", "_")
+                if m.group(2):
+                    slots["value"] = m.group(2).strip()
+    if slots["value"] is None:
+        m = re.search(r"([\d.]+\s*(?:USD\s*bn|bn|billion|%|percent))", sentence,
+                      re.IGNORECASE)
+        if m:
+            slots["value"] = m.group(1).strip()
+    m = re.search(r"\b(GAAP|non-GAAP|domestic(?:\s+only)?|global(?:\s+only)?)\b",
+                  sentence, re.IGNORECASE)
+    if m:
+        slots["qualifier"] = m.group(1).strip()
+    m = re.search(r"\bFY\s?(\d{4})\b", sentence, re.IGNORECASE)
+    if m:
+        slots["time_scope"] = f"FY{m.group(1)}"
+    else:
+        m = re.search(r"\b((?:19|20)\d{2})\b", sentence)
+        if m:
+            slots["time_scope"] = m.group(1)
+    return slots

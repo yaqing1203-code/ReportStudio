@@ -151,7 +151,7 @@ class ToolRouter:
             outcome = "invalid_args"
             return ToolResult(ok=False, tool=tool_name,
                               error=f"Argument validation failed: {e.message}")
-        except Exception as e:  # unexpected — do not leak internals to the agent
+        except Exception:  # unexpected — do not leak internals to the agent
             outcome = "internal_error"
             log.exception("tool %s crashed", tool_name)
             return ToolResult(ok=False, tool=tool_name, error="Internal tool error.")

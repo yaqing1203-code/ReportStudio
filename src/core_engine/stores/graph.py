@@ -176,8 +176,7 @@ def _strip_agtype(raw: Any) -> Any:
         return None
     s = str(raw)
     for suffix in ("::vertex", "::edge", "::path"):
-        if s.endswith(suffix):
-            s = s[: -len(suffix)]
+        s = s.removesuffix(suffix)
     return json.loads(s)
 
 
@@ -208,7 +207,12 @@ def _path_from_agtype(raw: Any) -> GraphPath:
 def _escape(value: str) -> str:
     """Escape single quotes for safe Cypher string-literal interpolation.
 
-    Defense-in-depth only: callers pass ontology-validated identifiers. Never rely
-    on this for untrusted free-form SQL — the AGE cypher() wrapper is the boundary.
+    WARNING — defense-in-depth ONLY. Apache AGE's cypher() does not support
+    parameter binding, so every value reaching a query string is interpolated via
+    this hand-rolled escaper. Hand-rolled escaping is a known-fragile pattern:
+    before enabling this (dormant) layer, audit EVERY interpolation point that
+    funnels into cypher() and prefer restructuring queries so untrusted free-form
+    text never reaches them. Callers are expected to pass ontology-validated
+    identifiers only.
     """
     return value.replace("\\", "\\\\").replace("'", "\\'")

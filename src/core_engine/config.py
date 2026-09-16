@@ -13,6 +13,20 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
+# Localized display headings for every known section id (the 5 mandated sections plus
+# the synthesis-layer sections). resolved_sections() falls back to the configured
+# heading for ids not listed here.
+_SECTION_HEADINGS: dict[str, dict[str, str]] = {
+    "industry_overview": {"en": "Industry Overview", "zh": "行业概览"},
+    "policy_analysis": {"en": "Policy Analysis", "zh": "政策分析"},
+    "industry_chain": {"en": "Industry Chain Map", "zh": "产业链图谱"},
+    "market_size": {"en": "Market Size", "zh": "市场规模"},
+    "competitive_landscape": {"en": "Competitive Landscape", "zh": "竞争格局"},
+    "source_comparison": {"en": "Source Comparison & Divergence",
+                          "zh": "来源对比与分歧分析"},
+    "limitations": {"en": "Information Limitations", "zh": "信息局限性声明"},
+}
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="CE_", env_file=".env", extra="ignore")
@@ -100,6 +114,9 @@ class Settings(BaseSettings):
     scrape_timeout_s: float = 20.0
     scrape_user_agent: str = "CoreEngineReportBot/0.1 (+contact@example.com)"
     scrape_respect_robots: bool = True
+    # When robots.txt can't be fetched (timeout/error): True permits the page anyway
+    # (fail-open, still rate-limited); False skips it (fail-closed).
+    scrape_robots_fail_open: bool = True
     # --- Scrape performance / stability ---
     # Pages are fetched CONCURRENTLY (bounded) instead of one-by-one, so 24 pages don't
     # serialise into minutes. Each fetch also has a HARD per-URL wall-clock so one slow
@@ -111,6 +128,26 @@ class Settings(BaseSettings):
     search_max_retries: int = 3
     search_retry_base_s: float = 1.0         # backoff: base * 2**attempt (+ jitter)
     search_timeout_s: float = 30.0           # strict per-attempt timeout for a search call
+    # --- Search routing + extra backends (Search Router) ---
+    # Optional higher-quality backends the router can pick per query type. Both are
+    # instantiated by name via scrape.get_search_provider("firecrawl" | "jina").
+    firecrawl_api_key: str = ""              # CE_FIRECRAWL_API_KEY (structured/table queries)
+    jina_api_key: str = ""                   # CE_JINA_API_KEY (optional; keyless works, tighter limits)
+    # When True and no single provider was explicitly injected, gather_sources routes
+    # each query through report/router.py (query-type classification + per-type backend
+    # fallback chain). Set False to pin the legacy single-provider behavior.
+    search_router_enabled: bool = True
+    # On-disk search-result cache (user_data_dir()/search_cache), keyed by
+    # sha256(backend + query). 0 disables caching.
+    search_cache_ttl_s: float = 86400.0
+    # --- Credibility-weighted source ranking (L1-L4) ---
+    # After the relevance filter, kept sources are ordered by
+    #   relevance * rank_w_relevance + credibility.weight * rank_w_source
+    #   + freshness * rank_w_freshness
+    # so a high-relevance but weak (L4) source cannot outrank L1/L2 anchors.
+    rank_w_relevance: float = 0.5
+    rank_w_source: float = 0.35
+    rank_w_freshness: float = 0.15
     # robots.txt check has its own short timeout so it can't double per-page latency.
     robots_timeout_s: float = 5.0
     # Multi-query research: instead of one search on the raw topic, the gatherer
@@ -183,17 +220,37 @@ class Settings(BaseSettings):
     #               synthesized industry-report claims.
     verify_mode: str = "traceable"           # "traceable" | "strict"
     # --- Verification STRATEGY (speed vs. strictness) ---------------------------------
-    #   "conflict_only" (DEFAULT) — fast path. Do NOT fact-check each claim against its
-    #       sources. Accept every extracted claim as fact, and spend LLM calls ONLY to
-    #       resolve DIRECT CONTRADICTIONS between claims about the same subject: cluster
-    #       claims by shared subject terms, LLM-check only the similar pairs, and when two
-    #       claims conflict keep the higher-authority one (drop the other). A claim with no
-    #       contradicting counterpart is accepted untouched. This trades the per-claim
-    #       anti-fabrication guarantee for a large speedup (calls ~= conflicting pairs,
-    #       not claims x sources).
+    #   "aligned" (DEFAULT) — alignment/fusion layer. Like conflict_only it accepts every
+    #       claim up-front, but claims carrying structured slots (entity/attribute/value)
+    #       are first alias-normalized and clustered by (entity, attribute); inside a
+    #       cluster pairs are classified as corroborate / complement / conflict (conflicts
+    #       drop the lower-authority claim). Single-source L3/L4 claims are marked
+    #       ISOLATED (孤证) and get consistency / deviation / source-note review plus an
+    #       optional one-round active-verification re-search. Claims without structured
+    #       slots fall back to the lexical conflict path.
+    #   "conflict_only" — fast path (previous default). Accept all claims; spend LLM calls
+    #       ONLY resolving DIRECT CONTRADICTIONS between same-subject claims (lexical
+    #       prefilter + contradiction oracle; lower authority loses).
     #   "cross_reference" — legacy broad-collection model: every claim is traced/entailed
     #       against its own sources and the whole pool, then tiered. Stricter, slower.
-    verify_strategy: str = "conflict_only"   # "conflict_only" | "cross_reference"
+    verify_strategy: str = "aligned"         # "aligned" | "conflict_only" | "cross_reference"
+    # --- Aligned strategy knobs ---
+    # Deviation score (0-1, LLM domain-common-sense judgement) above which an ISOLATED
+    # claim is considered an outlier vs. its field's baseline and downgraded one
+    # credibility level.
+    alignment_deviation_threshold: float = 0.6
+    # Active verification for core isolated claims: at most this many proxy-metric
+    # queries are generated and re-searched (one round only, no recursion).
+    active_verify_max_queries: int = 3
+    active_verify_enabled: bool = True
+    # --- Human-in-the-loop review (workflow F, default OFF) ---
+    # When True, the pipeline PAUSES after verification (before assembly) whenever at
+    # least one CORE isolated claim survived — a claim backed by a single source whose
+    # credibility is L3 or stronger (numeric level <= 3). The run emits an
+    # 'awaiting_confirmation' progress event carrying a summary of those claims and
+    # waits for a human decision via a ConfirmationGate: "continue" proceeds to
+    # assembly, "abort" halts the run. A gate timeout defaults to "continue".
+    hitl_on_isolated_core_claim: bool = False
     # conflict_only: max distinct subject terms two claims must share (as a fraction of the
     # smaller claim's terms) before we spend an LLM contradiction check on the pair. Higher
     # = fewer, more-precise pair checks. The gate is purely lexical, so it costs nothing.
@@ -279,6 +336,30 @@ class Settings(BaseSettings):
         ("market_size", "Market Size"),
         ("competitive_landscape", "Competitive Landscape"),
     )
+    # Report language: "en" (default) or "zh". Drives localized section headings
+    # (resolved_sections), the report title, the out-of-scope message, and the
+    # LaTeX preamble (ctex for zh).
+    report_locale: str = "en"                # "en" | "zh"
+    # Synthesis-layer sections appended after the mandated five: 'source_comparison'
+    # (only when alignment clusters exist) and 'limitations' (always, when enabled).
+    enable_synthesis_sections: bool = True
+
+    def resolved_sections(self) -> list[tuple[str, str]]:
+        """The full ordered section plan with locale-appropriate headings.
+
+        The 5 mandated sections keep their configured headings under "en" and switch
+        to the Chinese titles under "zh"; the synthesis-layer sections
+        (source_comparison, limitations) are appended when enabled."""
+        locale = (self.report_locale or "en").lower()
+        out: list[tuple[str, str]] = []
+        for sid, heading in self.report_sections:
+            localized = _SECTION_HEADINGS.get(sid, {}).get(locale) if locale != "en" else None
+            out.append((sid, localized or heading))
+        if self.enable_synthesis_sections:
+            for sid in ("source_comparison", "limitations"):
+                titles = _SECTION_HEADINGS[sid]
+                out.append((sid, titles.get(locale, titles["en"])))
+        return out
 
     # --- Charts / KG ---
     enable_charts: bool = True               # emit TikZ / pgfplots / booktabs

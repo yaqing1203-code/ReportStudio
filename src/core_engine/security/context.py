@@ -9,9 +9,10 @@ Decision locked in: shared-schema + RLS (no physical per-tenant isolation).
 """
 from __future__ import annotations
 
+from collections.abc import Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Sequence
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:  # driver only needed to actually connect; annotations are strings
     import psycopg
@@ -40,7 +41,7 @@ class RequestContext:
         user_id: str,
         roles: Sequence[str] = (),
         attributes: dict[str, str] | None = None,
-    ) -> "RequestContext":
+    ) -> RequestContext:
         return cls(
             tenant_id=tenant_id,
             user_id=user_id,

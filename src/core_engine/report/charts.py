@@ -18,6 +18,8 @@ render a graceful "insufficient verified data" note instead of a broken figure.
 """
 from __future__ import annotations
 
+from urllib.parse import urlparse
+
 from core_engine.report.kg import ChainTier, ReportKnowledgeGraph
 from core_engine.report.latex import tex_escape
 
@@ -46,8 +48,8 @@ def industry_chain_tikz(kg: ReportKnowledgeGraph) -> str:
     lines: list[str] = [
         r"\begin{tikzpicture}[",
         r"    node distance=0.6cm and 1.8cm,",
-        r"    tiernode/.style={draw, rounded corners, align=center, "
-        r"fill=primary!8, draw=primary, text width=2.6cm, minimum height=0.9cm, font=\small},",
+        (r"    tiernode/.style={draw, rounded corners, align=center, "
+         r"fill=primary!8, draw=primary, text width=2.6cm, minimum height=0.9cm, font=\small},"),
         r"    tierhead/.style={font=\bfseries\color{primary}},",
         r"    supply/.style={-{Latex[length=2mm]}, draw=accent, thick},",
         r"]",
@@ -209,13 +211,108 @@ def competitive_share_bar(kg: ReportKnowledgeGraph) -> str:
     return "\n".join(lines)
 
 
-def build_all(kg: ReportKnowledgeGraph) -> dict[str, str]:
+def build_all(kg: ReportKnowledgeGraph, clusters: list[dict] | None = None) -> dict[str, str]:
     """Render every chart fragment once, keyed for the template. Empty strings mean
-    'not enough verified data' and the template renders a fallback note."""
+    'not enough verified data' and the template renders a fallback note.
+
+    `clusters` is the alignment layer's per-cluster comparison data
+    (VerificationReport.clusters); it feeds the source-comparison matrix."""
     return {
         "chain_tikz": industry_chain_tikz(kg),
         "market_plot": market_size_plot(kg),
         "market_callout": market_size_callout(kg),
         "competitive_table": competitive_table(kg),
         "competitive_bar": competitive_share_bar(kg),
+        "comparison_matrix": comparison_matrix(clusters or []),
     }
+
+
+# --------------------------------------------------------------------------
+# Source Comparison -> booktabs matrix (workflow E: structured synthesis layer)
+# --------------------------------------------------------------------------
+def _domain_of(url: str) -> str:
+    """Registrable-looking host from a source URL ('https://www.iea.org/x' ->
+    'iea.org'); falls back to the raw string, then 'unknown'."""
+    host = urlparse(url or "").netloc
+    host = host.removeprefix("www.")
+    return host or (url.strip() or "unknown")
+
+
+def comparison_matrix(clusters: list[dict]) -> str:
+    """A booktabs matrix of the alignment layer's clusters: one row per
+    (entity, attribute), one column per source/calibre (domain + qualifier), cells
+    holding the reported value.
+
+    Cells backed by a credibility-L4 (weak-signal) source are marked with a dagger
+    and a footnote line follows the table. Returns "" when there are no clusters or
+    no cell carries a value. Content-only (no float env), like competitive_table.
+    """
+    if not clusters:
+        return ""
+
+    # Columns = distinct (domain, qualifier) pairs, in first-seen order.
+    columns: list[tuple[str, str]] = []
+    for cluster in clusters:
+        for cell in cluster.get("cells", []):
+            key = (_domain_of(str(cell.get("source_url") or "")),
+                   str(cell.get("qualifier") or ""))
+            if key not in columns:
+                columns.append(key)
+    if not columns:
+        return ""
+
+    col_index = {key: i for i, key in enumerate(columns)}
+    rows: list[tuple[str, str, list[str], bool]] = []  # entity, attribute, cells, has_dagger
+    any_value = False
+    any_dagger = False
+    for cluster in clusters:
+        entity = str(cluster.get("entity") or "")
+        attribute = str(cluster.get("attribute") or "")
+        cells = [""] * len(columns)
+        has_dagger = False
+        for cell in cluster.get("cells", []):
+            value = cell.get("value")
+            if value is None or str(value).strip() == "":
+                continue
+            any_value = True
+            key = (_domain_of(str(cell.get("source_url") or "")),
+                   str(cell.get("qualifier") or ""))
+            text = tex_escape(str(value))
+            if cell.get("credibility") == 4:
+                text += r"\(^\dagger\)"
+                has_dagger = True
+            cells[col_index[key]] = text
+        rows.append((entity, attribute, cells, has_dagger))
+        any_dagger = any_dagger or has_dagger
+    if not any_value:
+        return ""
+
+    ncols = len(columns)
+    val_w = max(0.10, 0.60 / ncols)
+    colspec = (r"@{}p{0.16\textwidth}p{0.14\textwidth}"
+               + rf"p{{{val_w:.2f}\textwidth}}" * ncols + r"@{}")
+
+    def _col_head(domain: str, qualifier: str) -> str:
+        head = tex_escape(domain)
+        if qualifier:
+            head += rf" ({tex_escape(qualifier)})"
+        return rf"\textbf{{{head}}}"
+
+    out = [
+        r"\begin{tabular}{" + colspec + "}",
+        r"\toprule",
+        r"\textbf{Entity} & \textbf{Attribute} & "
+        + " & ".join(_col_head(d, q) for d, q in columns) + r" \\",
+        r"\midrule",
+    ]
+    for entity, attribute, cells, _has_dagger in rows:
+        rendered = [c if c else "—" for c in cells]
+        out.append(
+            rf"{tex_escape(entity)} & {tex_escape(attribute)} & "
+            + " & ".join(rendered) + r" \\"
+        )
+        out.append(r"\addlinespace")
+    out += [r"\bottomrule", r"\end{tabular}"]
+    if any_dagger:
+        out.append(r"\footnotesize \(\dagger\) single low-credibility source, unverified.")
+    return "\n".join(out)

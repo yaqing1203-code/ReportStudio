@@ -137,10 +137,6 @@ async def build_report_kg(topic: str, verified: list[Claim], llm) -> ReportKnowl
     figure on the map that isn't backed by one of them. `llm` is untyped here to
     avoid a circular import with report.llm.
     """
-    from core_engine.report.kg import (  # local import keeps module import-cheap
-        ChainEdge, ChainNode, ChainTier, Competitor, MarketDatum, MarketSize,
-    )
-
     verified_ids = {c.id for c in verified}
     by_id = {c.id: c for c in verified}
     extraction = await llm.extract_kg(topic, [(c.id, c.text) for c in verified])

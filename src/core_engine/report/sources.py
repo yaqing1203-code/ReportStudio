@@ -22,7 +22,7 @@ from __future__ import annotations
 from urllib.parse import urlsplit
 
 from core_engine.config import get_settings
-from core_engine.report.models import SearchHit, SourceKind
+from core_engine.report.models import CredibilityLevel, SearchHit, SourceKind
 
 # User-generated / social / low-signal hosts. With the GENERAL_WEB tier admitting
 # most sites, this denylist becomes the real gatekeeper, so it is broader: social
@@ -39,7 +39,22 @@ _HARD_DENY_HOSTS = frozenset({
     "quora.com", "stackexchange.com", "stackoverflow.com", "wikipedia.org",
     "wikihow.com", "answers.com", "fandom.com",
     # content farms / aggregators
-    "pinterest.com", "slideshare.net", "scribd.com", "coursehero.com",
+    "slideshare.net", "scribd.com", "coursehero.com",
+})
+
+# Standards bodies (within the INDUSTRY_INSTITUTION tier) whose output counts as a
+# normative reference (国家标准 / international standards) -> credibility L1.
+_STANDARDS_HOSTS = frozenset({
+    "iso.org", "ieee.org", "itu.int", "ietf.org", "w3.org", "etsi.org", "ansi.org",
+})
+
+# WEAK-SIGNAL hosts (credibility L4): known social / UGC / anonymous or unattributed
+# platforms that sit just OUTSIDE the hard denylist — admitted (as GENERAL_WEB) for
+# coverage but carrying minimal trust weight. Personal-blog and content platforms
+# whose posts are typically self-published without editorial review.
+_L4_WEAK_HOSTS = frozenset({
+    "zhihu.com", "weibo.com", "douban.com", "toutiao.com", "csdn.net",
+    "jianshu.com", "baijiahao.baidu.com", "baike.baidu.com",
 })
 
 
@@ -50,7 +65,7 @@ def extract_domain(url: str) -> str:
     except ValueError:
         return ""
     host = host.lower()
-    return host[4:] if host.startswith("www.") else host
+    return host.removeprefix("www.")
 
 
 def _registrable(host: str) -> str:
@@ -142,3 +157,34 @@ def distinct_authoritative_domains(urls: list[str]) -> set[str]:
         if classify(url) is not SourceKind.REJECTED:
             domains.add(extract_domain(url))
     return domains
+
+
+def credibility_for(url: str, kind: SourceKind | None = None) -> CredibilityLevel:
+    """Grade a URL's credibility L1-L4. Pure string logic, like classify().
+
+    Mapping (denylist hits are still rejected upstream — this never resurrects them):
+      L1  government / regulators / standards bodies / top academic venues
+      L2  leading media, think tanks / nonprofits, research houses (IB tier),
+          user-provided documents
+      L3  anything unrecognized that survived the denylist (default)
+      L4  known social / UGC / anonymous / self-published weak-signal hosts
+    """
+    host = extract_domain(url)
+    if not host:
+        return CredibilityLevel.L4
+    if kind is None:
+        kind = classify(url)
+    if kind is SourceKind.REJECTED:
+        return CredibilityLevel.L4
+    if host in _L4_WEAK_HOSTS or _registrable(host) in _L4_WEAK_HOSTS:
+        return CredibilityLevel.L4
+    if kind in (SourceKind.GOVERNMENT, SourceKind.ACADEMIC):
+        return CredibilityLevel.L1
+    if kind is SourceKind.INDUSTRY_INSTITUTION:
+        if host in _STANDARDS_HOSTS or _registrable(host) in _STANDARDS_HOSTS:
+            return CredibilityLevel.L1
+        return CredibilityLevel.L2
+    if kind in (SourceKind.AUTHORITATIVE_MEDIA, SourceKind.INVESTMENT_BANK,
+                SourceKind.NONPROFIT, SourceKind.USER_PROVIDED):
+        return CredibilityLevel.L2
+    return CredibilityLevel.L3

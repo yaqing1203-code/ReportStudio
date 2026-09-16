@@ -143,7 +143,7 @@ def compile_pdf(tex_path: Path, *, engine: str | None = None) -> Path:
         for i in range(passes):
             try:
                 proc = subprocess.run(
-                    argv, cwd=tmp_dir, capture_output=True, text=True,
+                    argv, cwd=tmp_dir, capture_output=True, text=True, check=False,
                     timeout=max(120.0, s.scrape_timeout_s * 12), env=env,
                 )
             except subprocess.TimeoutExpired:

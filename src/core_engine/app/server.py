@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -30,6 +31,8 @@ from typing import Any
 from pydantic import BaseModel
 
 from core_engine.app import runtime
+
+log = logging.getLogger(__name__)
 
 
 # ----- request/response models --------------------------------------------
@@ -87,11 +90,23 @@ class SettingsUpdate(BaseModel):
     latex_engine: str | None = None
 
 
+class ConfirmRequest(BaseModel):
+    """Human decision at the HITL isolated-claim review checkpoint (workflow F)."""
+    decision: str                     # "continue" | "abort"
+
+
+def _make_gate():
+    """Lazy factory for Job.gate: importing the pipeline at module import time would
+    pull in the whole report stack; defer it to the first job creation."""
+    from core_engine.report.pipeline import ConfirmationGate
+    return ConfirmationGate()
+
+
 @dataclass
 class Job:
     id: str
     topic: str
-    queue: "asyncio.Queue[dict]" = field(default_factory=asyncio.Queue)
+    queue: asyncio.Queue[dict] = field(default_factory=asyncio.Queue)
     status: str = "running"          # running | completed | out_of_scope | blocked | error
     pdf_path: str | None = None
     message: str = ""
@@ -100,13 +115,19 @@ class Job:
     # into the run (user documents + a brief's sources); `skip_search` builds the report
     # from those alone. `on_complete(result)` is an optional callback fired after the run
     # so the caller (e.g. the database session) can snapshot the outcome/sources.
-    extra_sources: "list | None" = None
+    extra_sources: list | None = None
     skip_search: bool = False
-    on_complete: "Any | None" = None
+    on_complete: Any | None = None
     # Persistent-history link. When set, _run_job updates this history entry on
     # completion (status, pdf_ready, and job_id -> whichever job just finished, so the
     # history item always downloads the best available PDF for the topic).
     history_id: str | None = None
+    # HITL review (workflow F). `gate` is handed to the pipeline run so it can pause at
+    # the isolated-claim checkpoint; `pending_confirmation` holds the parsed
+    # 'awaiting_confirmation' summary while the run waits for a human decision (None
+    # when no review is outstanding — the confirm endpoint answers 409 then).
+    gate: Any = field(default_factory=_make_gate)
+    pending_confirmation: dict | None = None
 
 
 _JOBS: dict[str, Job] = {}
@@ -121,9 +142,13 @@ _CONVERSATION = Conversation()
 def create_app():
     """Build the FastAPI app. Imported lazily by the shell so importing this module
     (e.g. in tests) does not require fastapi to be installed until it's actually run."""
-    from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-    from fastapi.responses import FileResponse, StreamingResponse
+    logging.basicConfig(level=logging.INFO)
+
+    from fastapi import FastAPI, File, HTTPException, UploadFile
+    from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
     from fastapi.staticfiles import StaticFiles
+
+    from core_engine import __version__
 
     # `from __future__ import annotations` (top of file) stringifies every endpoint
     # annotation; FastAPI resolves them via get_type_hints against THIS MODULE's
@@ -133,7 +158,29 @@ def create_app():
     # request/response models above for the same class of bug.
     globals().setdefault("UploadFile", UploadFile)
 
-    app = FastAPI(title="Core Engine Report Studio", version="1.0")
+    app = FastAPI(title="Core Engine Report Studio", version=__version__)
+
+    # Loopback session token: the pywebview shell generates a random token per launch
+    # and passes it via CE_APP_SESSION_TOKEN. When set, every API request must present
+    # it (?token= or X-Session-Token header) except the health probe (the shell polls
+    # it before the window exists). Static assets are exempt: <script>/<link> tags
+    # can't carry the token, and the attack surface that matters is the state-mutating
+    # /api/* surface. When unset (CLI runs, tests) all requests pass — preserving the
+    # no-auth desktop default.
+    @app.middleware("http")
+    async def session_token_guard(request, call_next):
+        import os
+
+        token = os.environ.get("CE_APP_SESSION_TOKEN")
+        if not token:
+            return await call_next(request)
+        path = request.url.path
+        if not path.startswith("/api/") or path == "/api/health":
+            return await call_next(request)
+        presented = request.query_params.get("token") or request.headers.get("X-Session-Token")
+        if presented != token:
+            return JSONResponse({"detail": "invalid session token"}, status_code=401)
+        return await call_next(request)
 
     # Request/response models are defined at MODULE level (see top of file) — they
     # must NOT be nested here or FastAPI mis-resolves them as query params under
@@ -202,11 +249,12 @@ def create_app():
     async def send_message(req: MessageRequest) -> ChatResponse | ReportResponse:
         """Dual-mode endpoint: classifies intent and routes to chat or report generation."""
         import logging as _logging
+
         from core_engine.app.intent import (
+            IntentType,
             LLMNotConfiguredError,
             classify_intent,
             handle_chat,
-            IntentType,
         )
 
         _log = _logging.getLogger("core_engine.app.server")
@@ -453,6 +501,26 @@ def create_app():
         asyncio.create_task(_run_job(job))
         return {"job_id": job.id}
 
+    # ----- HITL review (workflow F) -----------------------------------------
+    @app.post("/api/jobs/{job_id}/confirm")
+    async def confirm_job(job_id: str, req: ConfirmRequest) -> dict[str, bool]:
+        """Deliver the human decision for a job paused at the isolated-claim review
+        checkpoint. 404 unknown job; 409 when the job is not waiting for a decision."""
+        job = _JOBS.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="Unknown job.")
+        if job.pending_confirmation is None:
+            raise HTTPException(
+                status_code=409,
+                detail="This job is not waiting for a confirmation.")
+        decision = req.decision.strip().lower()
+        if decision not in ("continue", "abort"):
+            raise HTTPException(
+                status_code=400, detail="decision must be 'continue' or 'abort'.")
+        job.gate.decide(decision)
+        job.pending_confirmation = None
+        return {"ok": True}
+
     @app.get("/api/report/{job_id}/events")
     async def report_events(job_id: str):
         job = _JOBS.get(job_id)
@@ -476,7 +544,7 @@ def create_app():
             while True:
                 try:
                     item = await asyncio.wait_for(job.queue.get(), timeout=HEARTBEAT_S)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     # No real event yet — send a keep-alive tick and keep waiting.
                     yield f"data: {json.dumps({'heartbeat': True})}\n\n"
                     continue
@@ -515,38 +583,45 @@ def create_app():
 
 async def _run_job(job: Job) -> None:
     """Execute one pipeline run, pushing progress events onto the job queue."""
-    from core_engine.report.models import PipelineStatus
-    from core_engine.report.pipeline import ReportPipeline
     from core_engine.config import get_settings
-    import sys
+    from core_engine.report.pipeline import ReportPipeline
 
     loop = asyncio.get_running_loop()
 
     def on_progress(stage: str, detail: str) -> None:
         # Called from within the async pipeline (same loop). Use call_soon_threadsafe
         # defensively in case a provider ever hops threads.
+        if stage == "awaiting_confirmation":
+            # HITL checkpoint (workflow F): the pipeline is now blocked on job.gate.
+            # Stash the parsed summary so /api/jobs/{id}/confirm can tell a real
+            # pending review (200) from a stale/duplicate confirm (409).
+            try:
+                job.pending_confirmation = json.loads(detail)
+            except Exception:
+                job.pending_confirmation = {"claims": [], "raw": detail}
+        elif stage == "confirmation_resolved":
+            job.pending_confirmation = None
         loop.call_soon_threadsafe(
             job.queue.put_nowait, {"stage": stage, "detail": detail}
         )
 
     try:
-        # Log startup diagnostics
-        print(f"[DEBUG] Starting report job: {job.id} for topic: {job.topic}", file=sys.stderr)
+        log.debug("Starting report job: %s for topic: %s", job.id, job.topic)
 
         # Check settings before creating pipeline
         settings = get_settings()
-        print(f"[DEBUG] LLM Provider: {settings.llm_provider}", file=sys.stderr)
-        print(f"[DEBUG] Search Provider: {settings.search_provider}", file=sys.stderr)
-        print(f"[DEBUG] Has Anthropic Key: {bool(settings.anthropic_api_key)}", file=sys.stderr)
-        print(f"[DEBUG] Has LLM Key: {bool(settings.llm_api_key)}", file=sys.stderr)
-        print(f"[DEBUG] Has Search Key: {bool(settings.search_api_key)}", file=sys.stderr)
+        log.debug("LLM Provider: %s", settings.llm_provider)
+        log.debug("Search Provider: %s", settings.search_provider)
+        log.debug("Has Anthropic Key: %s", bool(settings.anthropic_api_key))
+        log.debug("Has LLM Key: %s", bool(settings.llm_api_key))
+        log.debug("Has Search Key: %s", bool(settings.search_api_key))
 
         # Rebuild the pipeline per run so the latest saved settings (provider/key)
         # are picked up — get_settings cache is cleared on save.
-        print("[DEBUG] Creating ReportPipeline...", file=sys.stderr)
+        log.debug("Creating ReportPipeline...")
         pipeline = ReportPipeline()
 
-        print("[DEBUG] Starting pipeline.run()...", file=sys.stderr)
+        log.debug("Starting pipeline.run()...")
         # Overall run cap — a hard ceiling so the whole job can never hang the UI even
         # if some stage misbehaves beyond its own timeouts. Generous headroom over the
         # verification deadline + assembly + compile time. Doubled base minimum from 300s.
@@ -555,10 +630,13 @@ async def _run_job(job: Job) -> None:
             pipeline.run(
                 job.topic, on_progress=on_progress,
                 extra_sources=job.extra_sources, skip_search=job.skip_search,
+                confirmation_gate=job.gate,
             ),
             timeout=run_budget)
+        # The run is past any review checkpoint now — a confirm after this is a 409.
+        job.pending_confirmation = None
 
-        print(f"[DEBUG] Pipeline completed with status: {result.status.value}", file=sys.stderr)
+        log.debug("Pipeline completed with status: %s", result.status.value)
         job.status = result.status.value
         job.message = result.message
         job.pdf_path = result.pdf_path
@@ -568,7 +646,7 @@ async def _run_job(job: Job) -> None:
             try:
                 job.on_complete(result)
             except Exception as e:
-                print(f"[WARN] job on_complete hook failed: {e}", file=sys.stderr)
+                log.warning("job on_complete hook failed: %s", e)
 
         # Persist the PDF to permanent storage keyed by the job id, so it survives a
         # backend restart and history 'Download' can serve it from disk later.
@@ -576,9 +654,9 @@ async def _run_job(job: Job) -> None:
             try:
                 stored = runtime.store_pdf(job.id, Path(result.pdf_path), topic=job.topic)
                 job.pdf_path = str(stored)
-                print(f"[DEBUG] PDF persisted to {stored}", file=sys.stderr)
+                log.debug("PDF persisted to %s", stored)
             except Exception as e:
-                print(f"[WARN] could not persist PDF: {e}", file=sys.stderr)
+                log.warning("could not persist PDF: %s", e)
 
         # Update the persistent history entry so it survives restarts. The job that just
         # finished (brief OR comprehensive) becomes the one this history item downloads,
@@ -593,7 +671,7 @@ async def _run_job(job: Job) -> None:
                     pdf_ready=bool(result.pdf_path),
                 )
             except Exception as e:
-                print(f"[WARN] could not update history: {e}", file=sys.stderr)
+                log.warning("could not update history: %s", e)
 
         final = {
             "stage": _terminal_stage(result.status),
@@ -607,9 +685,9 @@ async def _run_job(job: Job) -> None:
             "final": True,          # sentinel: closes the SSE stream (see event_stream)
         }
         await job.queue.put(final)
-    except asyncio.TimeoutError:
+    except TimeoutError:
         # The overall run cap fired — always send a terminal event so the UI clears.
-        print(f"[ERROR] Job {job.id} exceeded the overall run time limit.", file=sys.stderr)
+        log.error("Job %s exceeded the overall run time limit.", job.id)
         job.status = "error"
         job.message = "The run exceeded the time limit and was stopped."
         _mark_history_error(job)
@@ -622,8 +700,7 @@ async def _run_job(job: Job) -> None:
     except Exception as e:  # never let a crash hang the SSE stream
         import traceback
         error_detail = traceback.format_exc()
-        print(f"[ERROR] Job {job.id} failed with exception:", file=sys.stderr)
-        print(error_detail, file=sys.stderr)
+        log.error("Job %s failed with exception:\n%s", job.id, error_detail)
 
         job.status = "error"
         job.message = str(e)
@@ -631,10 +708,11 @@ async def _run_job(job: Job) -> None:
         await job.queue.put({"stage": "error", "detail": f"Unexpected error: {e}",
                              "status": "error", "has_pdf": False, "final": True})
     finally:
+        job.pending_confirmation = None
         job.done.set()
 
 
-def _mark_history_error(job: "Job") -> None:
+def _mark_history_error(job: Job) -> None:
     """Best-effort: flag this job's history entry as failed so the sidebar reflects it."""
     if not job.history_id:
         return

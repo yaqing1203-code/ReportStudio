@@ -28,8 +28,9 @@ Import-cheap: no pipeline imports, safe to touch at startup.
 from __future__ import annotations
 
 import json
+import os
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -43,7 +44,7 @@ def _history_path() -> Path:
 
 
 def _now_ms() -> int:
-    return int(datetime.now(timezone.utc).timestamp() * 1000)
+    return int(datetime.now(UTC).timestamp() * 1000)
 
 
 def _load() -> list[dict]:
@@ -61,10 +62,14 @@ def _load() -> list[dict]:
 def _save(items: list[dict]) -> None:
     p = _history_path()
     try:
-        p.write_text(
+        # Atomic write: write to a sibling temp file then os.replace, so a crash
+        # mid-write can never leave a truncated/corrupt history.json behind.
+        tmp = p.with_suffix(".json.tmp")
+        tmp.write_text(
             json.dumps(items[:_MAX_ENTRIES], indent=2, ensure_ascii=False),
             encoding="utf-8",
         )
+        os.replace(tmp, p)
     except Exception:
         # Best-effort: never let a persistence failure break a request.
         pass

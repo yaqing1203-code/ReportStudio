@@ -86,6 +86,7 @@ hiddenimports = (
         "anthropic",          # optional LLM provider (guarded import at runtime)
         "openai",             # optional OpenAI-compatible provider
         "duckduckgo_search",  # keyless-search fallback (lazy import; static analysis misses it)
+        "ddgs",               # renamed DuckDuckGo search package (lazy import)
         "webview",
         "core_engine.app.server",
         "core_engine.report.pipeline",

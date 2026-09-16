@@ -24,6 +24,7 @@ def client(monkeypatch, tmp_path):
     monkeypatch.setattr(runtime, "user_data_dir", lambda: tmp_path)
 
     from fastapi.testclient import TestClient
+
     from core_engine.app.server import create_app
 
     return TestClient(create_app())

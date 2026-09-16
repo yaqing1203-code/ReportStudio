@@ -6,4 +6,4 @@ If you find yourself editing this package to onboard a vertical, a domain
 assumption has leaked into the core — push it back up into the adapter layer.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

@@ -93,16 +93,22 @@ def render_tex(report: ReportData, *, template: str = "report.tex.j2") -> str:
         min_sources=s.min_sources_per_claim,
         verify_rounds=s.verify_rounds,
         verify_mode=s.verify_mode,
+        locale=s.report_locale,
     )
 
 
 def write_tex(report: ReportData, out_dir: Path | None = None) -> Path:
     """Render and write the .tex file, returning its path."""
+    import hashlib
+
     s = get_settings()
     out_dir = out_dir or s.output_dir
     out_dir.mkdir(parents=True, exist_ok=True)
     slug = _slug(report.topic)
-    tex_path = out_dir / f"{slug}.tex"
+    # Append a short topic hash so two topics that slug-collide (e.g. differing only
+    # in punctuation/casing, or truncated at the 60-char cap) never overwrite each other.
+    hash8 = hashlib.sha1(report.topic.encode("utf-8")).hexdigest()[:8]
+    tex_path = out_dir / f"{slug}-{hash8}.tex"
     tex_path.write_text(render_tex(report), encoding="utf-8")
     return tex_path
 

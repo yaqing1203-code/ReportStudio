@@ -1,6 +1,6 @@
 """Standalone network / search diagnostic for Report Studio.
 
-Run:  python test_network.py         (uses the project's py311 env)
+Run:  python scripts/network_diag.py     (project installed via `pip install -e .`)
 
 Tests, in order:
   1. Raw connectivity to google.com / bing.com / duckduckgo.
@@ -15,9 +15,6 @@ from __future__ import annotations
 
 import asyncio
 import os
-import sys
-
-sys.path.insert(0, "src")
 
 LINES: list[str] = []
 

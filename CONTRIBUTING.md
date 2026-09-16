@@ -66,6 +66,10 @@ python packaging/build.py --fetch-tectonic
 ReportStudio/
 ├── src/core_engine/         # All Python source
 │   ├── report/              # Active report pipeline (CLI + library)
+│   │   ├── router.py        #   Search Router: query-type classification + backend chains
+│   │   ├── search_cache.py  #   On-disk TTL cache for search results
+│   │   ├── verify.py        #   Verification harness (aligned / conflict_only / cross_reference)
+│   │   └── ...              #   models/sources/scrape/llm/kg/charts/pipeline/latex/compile
 │   ├── app/                 # Desktop shell (pywebview + FastAPI)
 │   ├── agents/              # Agent abstractions
 │   ├── gateway/             # Tool router
@@ -79,6 +83,7 @@ ReportStudio/
 ├── adapters/default/        # Domain config (ontology + agent YAMLs)
 ├── db/init/                 # Postgres init SQL (run on first docker-compose up)
 ├── packaging/               # Build system (PyInstaller spec + helpers)
+├── scripts/                 # Developer utilities (network_diag.py connectivity checks)
 ├── tests/                   # pytest suite (anyio for async)
 ├── docker-compose.yml       # Optional Postgres with AGE + pgvector
 ├── pyproject.toml
@@ -144,8 +149,19 @@ CE_LLM_PROVIDER=fake CE_SEARCH_PROVIDER=fake pytest -q tests/test_report_pipelin
 
 - Tests live in `tests/` and are plain `pytest` files. Async tests use
   `pytestmark = pytest.mark.anyio` (NOT `pytest-asyncio`).
-- Prefer **offline** tests with `CE_LLM_PROVIDER=fake` and `CE_SEARCH_PROVIDER=fake`
-  so CI doesn't burn API credits.
+- The default suite is **fully offline**: `CE_LLM_PROVIDER=fake` and
+  `CE_SEARCH_PROVIDER=fake` give deterministic stand-ins, so CI never burns API
+  credits. Run everything with `pytest tests/ -q`.
+- Current test files at a glance:
+  - `test_report_pipeline.py` — source-filter / scope / verification gates, LaTeX escaping, end-to-end happy path
+  - `test_search_router.py` — query-type classification + backend fallback chains
+  - `test_search_cache.py` — disk-cache TTL, corruption handling, atomic writes
+  - `test_credibility.py` — L1-L4 credibility grading + weighted source ranking
+  - `test_alignment.py` — aligned strategy: (entity, attribute) clustering, corroborate/complement/conflict, isolated-claim review
+  - `test_comparison_report.py` — comparison matrix + synthesis sections (source_comparison / limitations)
+  - `test_hitl.py` — ConfirmationGate + `POST /api/jobs/{id}/confirm`
+  - `test_report_session_wiring.py`, `test_database_mode.py`, `test_database_store.py`,
+    `test_history_store.py`, `test_wiring.py` — app/session/store wiring
 - For unit tests, target the smallest interesting function or class.
 - For integration tests that need Postgres, gate them behind a marker so they're
   easy to skip locally:
@@ -169,7 +185,12 @@ CE_LLM_PROVIDER=fake CE_SEARCH_PROVIDER=fake pytest -q tests/test_report_pipelin
 
 - **Formatter:** `ruff format` (line-length 100, see `pyproject.toml`).
 - **Linter:** `ruff check` — please don't disable rules without a comment explaining why.
-- **Type hints:** encouraged on public functions. `mypy` is advisory, not blocking.
+  Four rules are globally ignored in `pyproject.toml`, each a deliberate choice:
+  - `BLE001` (blind `except Exception`) — the pipeline's graceful-degradation pattern is intentional (and almost always logged)
+  - `S110` / `S112` (`try-except-pass` / `-continue`) — best-effort spots like progress callbacks must never crash a run
+  - `B008` — the FastAPI idiom `file: UploadFile = File(...)`
+- **Type hints:** encouraged on public functions. `mypy` is advisory, not blocking
+  (`[tool.mypy]` in `pyproject.toml` sets `mypy_path = "src"`).
 - **Imports:** prefer `from __future__ import annotations` at the top of new modules.
 - **Naming:** snake_case modules & functions, PascalCase classes, UPPER_CASE constants.
 

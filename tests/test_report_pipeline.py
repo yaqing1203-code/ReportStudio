@@ -17,13 +17,13 @@ from core_engine.report.models import (
     PipelineStatus,
     ReportData,
     ReportSection,
+    SearchHit,
     Source,
     SourceKind,
 )
 from core_engine.report.pipeline import ReportPipeline
 from core_engine.report.scrape import FakeFetcher, FakeSearchProvider
 from core_engine.report.sources import classify, filter_hits
-from core_engine.report.models import SearchHit
 from core_engine.report.verify import VerificationHarness
 
 pytestmark = pytest.mark.anyio
@@ -95,7 +95,7 @@ def test_relevance_score_separates_deep_dive_from_superficial():
                    "lifestyle trends. " * 40) + "It mentions a solid-state battery once."
 
     d_deep, hits_deep = relevance_score(topic, deep)
-    d_sup, hits_sup = relevance_score(topic, superficial)
+    d_sup, _hits_sup = relevance_score(topic, superficial)
     # The deep-dive article has much higher topic-term density than the name-drop.
     assert d_deep > d_sup
     assert hits_deep >= 3       # covers several distinct topic terms
@@ -233,8 +233,8 @@ async def test_single_credible_source_is_likely_not_rumor(cross_ref):
 
 async def test_harness_drops_only_hallucinations(cross_ref, monkeypatch):
     """A claim a source flags as hallucinated is DROPPED; an uncorroborated one is not."""
-    from core_engine.report.llm import TraceJudgement
     from core_engine.config import get_settings
+    from core_engine.report.llm import TraceJudgement
 
     get_settings.cache_clear()
     monkeypatch.setenv("CE_VERIFY_MODE", "traceable")
@@ -282,11 +282,23 @@ async def test_harness_rejects_unsupported_claim(cross_ref):
 
 
 # --------------------------------------------------------------------------
-# Conflict-only strategy — the DEFAULT: accept all claims, resolve only direct
-# contradictions between same-subject claims (no per-claim source verification).
+# Conflict-only strategy — accept all claims, resolve only direct contradictions
+# between same-subject claims (no per-claim source verification). The DEFAULT is
+# now "aligned", so these tests pin "conflict_only" explicitly.
 # --------------------------------------------------------------------------
-async def test_conflict_only_accepts_all_without_source_checks():
-    """Default strategy accepts every extracted claim as fact and never calls the
+@pytest.fixture
+def conflict_only(monkeypatch):
+    """Opt a test into the fast 'conflict_only' verification strategy (the aligned
+    strategy is the default now; this keeps the legacy fast path under test)."""
+    from core_engine.config import get_settings
+    get_settings.cache_clear()
+    monkeypatch.setenv("CE_VERIFY_STRATEGY", "conflict_only")
+    yield
+    get_settings.cache_clear()
+
+
+async def test_conflict_only_accepts_all_without_source_checks(conflict_only):
+    """conflict_only accepts every extracted claim as fact and never calls the
     per-claim entailment/traceability oracle — proving the expensive step is bypassed."""
     from core_engine.report.models import ConfidenceTier
 
@@ -327,7 +339,7 @@ async def test_conflict_only_accepts_all_without_source_checks():
     assert report.kept_claims[0].supporting_sources() == ["https://cdc.gov/p"]
 
 
-async def test_conflict_only_drops_lower_authority_of_conflicting_pair():
+async def test_conflict_only_drops_lower_authority_of_conflicting_pair(conflict_only):
     """Two same-subject claims with diverging numbers contradict; the one backed by the
     lower-authority source is dropped, the higher-authority one kept."""
     shared_subject = "The national unemployment rate for 2024"
@@ -347,7 +359,7 @@ async def test_conflict_only_drops_lower_authority_of_conflicting_pair():
     assert "contradicted" in report.reasons["blog1"]
 
 
-async def test_conflict_only_keeps_nonconflicting_claim_untouched():
+async def test_conflict_only_keeps_nonconflicting_claim_untouched(conflict_only):
     """A claim with no contradicting counterpart is accepted with no verification
     overhead even when a contradiction oracle exists."""
     from core_engine.report.llm import FakeLLM as _F
@@ -423,13 +435,13 @@ def test_render_tex_escapes_report_content():
 def _authoritative_fixture():
     """Build a search provider + fetcher where 3 gov domains all state the same
     5 verifiable facts, so claims clear triple-check AND cross-reference."""
-    facts = " ".join([
-        "The initiative launched in 2021.",
-        "It allocated 5 billion dollars in funding.",
-        "Participation increased by 30 percent in 2022.",
-        "The program operated in 12 regions.",
-        "Officials reported a 95 percent satisfaction rate.",
-    ])
+    facts = (
+        "The initiative launched in 2021."
+        " It allocated 5 billion dollars in funding."
+        " Participation increased by 30 percent in 2022."
+        " The program operated in 12 regions."
+        " Officials reported a 95 percent satisfaction rate."
+    )
     body = f"Official statement. {facts} This concludes the summary of the record."
     urls = {
         "https://cdc.gov/report": body,
@@ -490,7 +502,7 @@ async def test_gather_survives_a_hanging_url(monkeypatch):
     events = []
     try:
         t0 = _time.monotonic()
-        sources, rejected = await gather_sources(
+        sources, _rejected = await gather_sources(
             "solid state battery supply chain", Prov(), HangingFetcher(),
             on_progress=lambda d, t, detail: events.append((d, t)))
         dt = _time.monotonic() - t0
@@ -639,7 +651,9 @@ async def test_assembly_runs_concurrently_under_deadline(monkeypatch):
     # Sequential would be ~ (1 KG + 1 insights + 5 sections + up-to-5 deep-dives) * 0.3s
     # ≈ 3.6s+. Concurrent (cap 8) collapses that to roughly one wave.
     assert dt < 2.5, f"assembly did not run concurrently (took {dt:.1f}s)"
-    assert len(data.sections) == 5
+    # 5 mandated sections + the deterministic 'limitations' closing section
+    # (no clusters in this fixture, so no 'source_comparison' section).
+    assert len(data.sections) == 6
 
 
 async def test_pipeline_generates_tex_when_gates_pass(monkeypatch):
@@ -846,27 +860,31 @@ async def test_pipeline_emits_five_mandated_sections_in_order(monkeypatch):
         get_settings.cache_clear()
     assert result.status is PipelineStatus.COMPLETED, result.message
     ids = [s.section_id for s in result.report.sections]
-    assert ids == ["industry_overview", "policy_analysis", "industry_chain",
-                   "market_size", "competitive_landscape"]
+    # The 5 mandated sections come first, in order; the synthesis layer may append
+    # 'source_comparison' (only when alignment clusters exist) and always appends
+    # the deterministic 'limitations' closing section.
+    assert ids[:5] == ["industry_overview", "policy_analysis", "industry_chain",
+                       "market_size", "competitive_landscape"]
+    assert set(ids[5:]) <= {"source_comparison", "limitations"}
 
 
 def _industry_fixture():
     """3 authoritative domains (gov + IB + institution) stating the same industry
     facts, including chain/market/competitor markers the FakeLLM KG extractor reads."""
-    facts = " ".join([
-        "The solar sector background shows strong adoption.",
-        "Government policy introduced a subsidy in 2021.",
-        "UPSTREAM: Polysilicon is a key input.",
-        "MIDSTREAM: Cell Manufacturing integrates components.",
-        "DOWNSTREAM: Installers serve end markets.",
-        "Polysilicon supplies Cell Manufacturing.",
-        "TAM is 200 USD bn for the market.",
-        "In 2021 the market was 90 USD bn.",
-        "In 2022 the market was 120 USD bn.",
-        "CAGR is 15% for the sector.",
-        "COMPETITOR: FirstCo share 30% advantage scale.",
-        "COMPETITOR: SecondCo share 20% advantage cost leadership.",
-    ])
+    facts = (
+        "The solar sector background shows strong adoption."
+        " Government policy introduced a subsidy in 2021."
+        " UPSTREAM: Polysilicon is a key input."
+        " MIDSTREAM: Cell Manufacturing integrates components."
+        " DOWNSTREAM: Installers serve end markets."
+        " Polysilicon supplies Cell Manufacturing."
+        " TAM is 200 USD bn for the market."
+        " In 2021 the market was 90 USD bn."
+        " In 2022 the market was 120 USD bn."
+        " CAGR is 15% for the sector."
+        " COMPETITOR: FirstCo share 30% advantage scale."
+        " COMPETITOR: SecondCo share 20% advantage cost leadership."
+    )
     body = f"Official industry report. {facts} End of record."
     urls = {
         "https://energy.gov/report": body,

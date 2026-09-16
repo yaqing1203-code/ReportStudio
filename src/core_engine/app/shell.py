@@ -81,7 +81,8 @@ def main() -> int:
             log_dir.mkdir(parents=True, exist_ok=True)
 
         log_path = log_dir / "app.log"
-        log_file = open(log_path, "a", encoding="utf-8")
+        log_file = open(log_path, "a", encoding="utf-8")  # noqa: SIM115
+        # 长寿命日志句柄：用于重定向 stdout/stderr，存活整个进程生命周期，不能用 with。
 
         if sys.stdout is None:
             sys.stdout = log_file
@@ -90,6 +91,17 @@ def main() -> int:
 
     # 1. Persisted settings -> env, BEFORE anything reads config.
     runtime.apply_settings_to_env()
+
+    # 1b. Per-launch session token: the loopback server is only reachable from this
+    # machine, but any local process (or a malicious page opened in the same user
+    # session via the system browser) could otherwise drive the API. The token is
+    # random per launch and passed to the server (same process) via the environment;
+    # the web UI receives it in the URL and echoes it on every request.
+    import os
+    import secrets
+
+    token = secrets.token_urlsafe(32)
+    os.environ["CE_APP_SESSION_TOKEN"] = token
 
     # 2/3. Start the server thread.
     host, port = "127.0.0.1", _free_port()
@@ -104,7 +116,8 @@ def main() -> int:
     # 5. Native window. Imported here so importing this module stays cheap/testable.
     import webview
 
-    webview.create_window(WINDOW_TITLE, base, width=1180, height=820, min_size=(900, 640))
+    webview.create_window(WINDOW_TITLE, f"{base}/?token={token}",
+                          width=1180, height=820, min_size=(900, 640))
     # Give the window the SAME "RS" icon as the exe so the taskbar, title bar, and
     # Alt+Tab thumbnail all match. pywebview>=5 accepts icon= on start(); if the file
     # is missing or the platform ignores it, we still start normally.

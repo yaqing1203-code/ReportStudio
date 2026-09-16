@@ -12,8 +12,8 @@ import io
 import pytest
 
 from core_engine.report.documents import (
-    DocumentError,
     SUPPORTED_EXTENSIONS,
+    DocumentError,
     parse_document,
 )
 from core_engine.report.models import PipelineStatus, Source, SourceKind
@@ -42,14 +42,14 @@ def test_parse_txt():
 
 def test_parse_markdown():
     raw = b"# Heading\n\nSolid-state batteries reached mass production.\n"
-    title, text = parse_document("brief.md", raw)
+    _title, text = parse_document("brief.md", raw)
     assert "Solid-state batteries" in text
 
 
 def test_parse_csv():
     buf = io.StringIO()
     csv.writer(buf).writerows([["Year", "Share"], ["2024", "12%"]])
-    title, text = parse_document("market.csv", buf.getvalue().encode("utf-8"))
+    _title, text = parse_document("market.csv", buf.getvalue().encode("utf-8"))
     assert "Year | Share" in text
     assert "2024 | 12%" in text
 
@@ -60,7 +60,7 @@ def test_parse_docx_roundtrip():
     doc.add_paragraph("Lithium supply is concentrated in three countries.")
     bio = io.BytesIO()
     doc.save(bio)
-    title, text = parse_document("supply.docx", bio.getvalue())
+    _title, text = parse_document("supply.docx", bio.getvalue())
     assert "Lithium supply is concentrated" in text
 
 
@@ -72,7 +72,7 @@ def test_parse_xlsx_roundtrip():
     ws.append(["TAM", "50 billion"])
     bio = io.BytesIO()
     wb.save(bio)
-    title, text = parse_document("sizing.xlsx", bio.getvalue())
+    _title, text = parse_document("sizing.xlsx", bio.getvalue())
     assert "Metric | Value" in text
     assert "TAM | 50 billion" in text
 

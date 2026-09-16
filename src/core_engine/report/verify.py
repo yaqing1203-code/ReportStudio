@@ -1,6 +1,24 @@
-"""Verification harness — two selectable strategies (see Settings.verify_strategy).
+"""Verification harness — three selectable strategies (see Settings.verify_strategy).
 
-STRATEGY "conflict_only" (DEFAULT, fast): prioritizes speed over strict fact-checking.
+STRATEGY "aligned" (DEFAULT): the alignment/fusion layer. Like conflict_only it ACCEPTS
+every extracted claim up-front (no per-claim entailment), but adds structure-aware
+fusion on top:
+  1. entity alias normalization — one batched LLM call maps aliases ("CATL"/"宁德时代")
+     to a canonical name, so the same real-world subject clusters together;
+  2. clustering — claims carrying structured slots group by (entity, attribute);
+     claims WITHOUT slots fall back to the lexical conflict path of conflict_only;
+  3. intra-cluster tri-classification — corroborate (same calibre: evidence merged),
+     complement (different qualifier/time_scope: BOTH kept, noted), or conflict
+     (resolved by source authority, lower dropped);
+  4. isolated-claim (孤证) marking — single-source claims at credibility L3/L4;
+  5. isolated review — internal-consistency check and domain-baseline deviation score
+     (each can downgrade credibility one level), a provenance/timeliness source note,
+     and (optionally) ONE bounded round of active verification: proxy-metric queries
+     are generated and re-searched, and corroborating hits can lift the isolated flag.
+The per-cluster comparison data is exported on VerificationReport.clusters for the
+synthesis layer (comparison matrix rendering).
+
+STRATEGY "conflict_only" (fast): prioritizes speed over strict fact-checking.
 It does NOT verify each claim against its sources. Every extracted claim is ACCEPTED as
 fact; the only LLM work is resolving DIRECT CONTRADICTIONS between claims that talk about
 the same subject (found by a cheap lexical prefilter). When two claims conflict, the
@@ -35,23 +53,24 @@ Every kept claim still traces to a real source — the pipeline never emits ungr
 """
 from __future__ import annotations
 
-import logging
-from dataclasses import dataclass, field
-
 import asyncio
+import json
+import logging
 import re
 import time
+from dataclasses import dataclass, field
 
 from core_engine.config import get_settings
-from core_engine.report.llm import LLM
+from core_engine.report.llm import LLM, _safe_json_list, _safe_json_obj
 from core_engine.report.models import (
     Claim,
     ConfidenceTier,
+    CredibilityLevel,
     Evidence,
     Source,
     SourceKind,
 )
-from core_engine.report.sources import extract_domain
+from core_engine.report.sources import classify, credibility_for, extract_domain
 
 # Relative authority of a source kind, used ONLY by conflict-only resolution to decide
 # which of two contradicting claims to keep. Higher wins. Mirrors the high-trust tiers.
@@ -160,6 +179,20 @@ class VerificationReport:
     timed_out: bool = False
     claims_seen: int = 0          # how many claims we actually got to classify
     claims_total: int = 0         # how many were queued
+    # --- Alignment clusters (verify_strategy="aligned" only) ---
+    # Data interface for the synthesis layer (workflow E: comparison matrix). One dict
+    # per (entity, attribute) cluster that held >= 2 claims:
+    #   {
+    #     "entity": <canonical entity name>,
+    #     "attribute": <the measured property>,
+    #     "cells": [{"source_url": str, "value": str|None, "qualifier": str|None,
+    #                "credibility": int|None, "claim_text": str}],   # one per claim
+    #     "relation": "corroborate" | "complement" | "conflict",
+    #   }
+    # relation is the strongest intra-cluster outcome observed: "conflict" if any pair
+    # contradicted (loser dropped from kept_claims), else "complement" if any pair
+    # differed in qualifier/time_scope (both kept), else "corroborate" (evidence merged).
+    clusters: list[dict] = field(default_factory=list)
 
     # --- tier views ---
     @property
@@ -193,21 +226,31 @@ class VerificationReport:
 
 class VerificationHarness:
     """Runs the triple-check + cross-reference gate. Pure logic over an LLM entailment
-    oracle and the fetched sources; no network of its own."""
+    oracle and the fetched sources; no network of its own — EXCEPT the aligned
+    strategy's optional one-round active verification, which searches/fetches through
+    the injected `search_fn`/`fetcher` (defaults: the search router + real fetcher)."""
 
-    def __init__(self, llm: LLM) -> None:
+    def __init__(self, llm: LLM, *, fetcher=None, search_fn=None) -> None:
         self._llm = llm
         self._s = get_settings()
+        # fetcher: scraper Fetcher for active-verification page fetches (optional).
+        self._fetcher = fetcher
+        # search_fn: async (query) -> list[SearchHit]; None = route via router.py.
+        self._search_fn = search_fn
 
     async def verify(
         self, claims: list[Claim], sources: list[Source], *, on_progress=None,
     ) -> VerificationReport:
         """Dispatch to the configured verification strategy.
 
-        "conflict_only" (default, fast): accept all claims; only resolve direct
-        contradictions between same-subject claims. See `_verify_conflict_only`.
+        "aligned" (default): accept-all + entity alignment clustering + isolated-claim
+        review. See `_verify_aligned`.
+        "conflict_only" (fast): accept all claims; only resolve direct contradictions
+        between same-subject claims. See `_verify_conflict_only`.
         "cross_reference" (legacy, strict): the broad-collection cross-check below.
         """
+        if self._s.verify_strategy == "aligned":
+            return await self._verify_aligned(claims, sources, on_progress=on_progress)
         if self._s.verify_strategy == "conflict_only":
             return await self._verify_conflict_only(
                 claims, sources, on_progress=on_progress)
@@ -283,7 +326,7 @@ class VerificationHarness:
             try:
                 verdict = await asyncio.wait_for(
                     self._llm.check_contradiction(a.text, b.text), timeout=budget)
-            except (asyncio.TimeoutError, Exception) as e:
+            except (TimeoutError, Exception) as e:
                 # Fail-open: an unresolved pair is NOT a conflict — accept both, move on.
                 log.warning("verify(conflict): pair check failed (%s) — keeping both",
                             type(e).__name__)
@@ -409,6 +452,481 @@ class VerificationHarness:
                 best = max(best, _KIND_AUTHORITY.get(src.kind, 1))
         return best
 
+    # ======================================================================
+    # Aligned strategy (default) — entity alignment + isolated-claim review
+    # ======================================================================
+    async def _verify_aligned(
+        self, claims: list[Claim], sources: list[Source], *, on_progress=None,
+    ) -> VerificationReport:
+        """Accept-all + structure-aware fusion (see module docstring, strategy "aligned").
+
+        Steps: accept every claim as fact -> entity alias normalization -> cluster
+        structured claims by (entity, attribute) and tri-classify intra-cluster pairs
+        (corroborate / complement / conflict) -> lexical conflict path for unstructured
+        claims -> isolated (孤证) marking -> isolated review (internal consistency,
+        baseline deviation, source note, one bounded round of active verification).
+
+        The stage is bounded by `verify_deadline_s`; on deadline we stop issuing LLM
+        checks and return what we have (fail-open, matching conflict_only).
+        """
+        by_url = {s.url: s for s in sources}
+        report = VerificationReport(rounds_run=0)
+        report.claims_total = len(claims)
+        report.claims_seen = len(claims)
+        if not claims:
+            return report
+        deadline = time.monotonic() + self._s.verify_deadline_s
+
+        def _emit(i: int, total: int, text: str) -> None:
+            if on_progress:
+                try:
+                    on_progress(i, total, text)
+                except Exception:
+                    pass  # progress is best-effort, never break verification
+
+        # 1) Accept every claim as fact up-front (same contract as conflict_only) and
+        #    pin its credibility to the STRONGEST candidate source when unset.
+        for c in claims:
+            self._accept_as_fact(c, by_url)
+            if c.credibility is None:
+                c.credibility = self._best_credibility(c, by_url)
+        _emit(0, len(claims), f"Accepted {len(claims)} claim(s); aligning entities…")
+
+        # 2) Entity alias normalization (one batched LLM call; fail-open to identity).
+        await self._normalize_entities(claims, deadline)
+
+        # 3) Cluster + tri-classify structured claims; lexical path for the rest.
+        dropped = await self._classify_clusters(claims, by_url, report, deadline, _emit)
+        await self._check_unstructured_conflicts(
+            claims, by_url, report, deadline, dropped, _emit)
+
+        # 4) Partition kept vs. conflict-dropped.
+        for c in claims:
+            if c.id in dropped:
+                c.verified = False
+                c.confidence = None
+                report.rejected_claims.append(c)
+                report.reasons[c.id] = dropped[c.id]
+            else:
+                report.kept_claims.append(c)
+
+        # 5) Isolated (孤证) marking: single candidate source at credibility L3/L4.
+        for c in report.kept_claims:
+            c.isolated = (len(c.candidate_source_urls) == 1
+                          and c.credibility is not None
+                          and c.credibility >= CredibilityLevel.L3)
+
+        # 6) Isolated review + optional one-round active verification.
+        await self._review_isolated(report, by_url, sources, deadline, _emit)
+        log.info("verify(aligned): kept %d/%d claim(s); %d dropped, %d isolated, "
+                 "%d cluster(s)", len(report.kept_claims), len(claims),
+                 len(report.rejected_claims),
+                 sum(1 for c in report.kept_claims if c.isolated),
+                 len(report.clusters))
+        return report
+
+    def _best_credibility(
+        self, claim: Claim, by_url: dict[str, Source]
+    ) -> CredibilityLevel:
+        """Strongest (smallest-numbered) credibility among the claim's candidate
+        sources; L3 (industry consensus) when none resolve."""
+        best = CredibilityLevel.L3
+        found = False
+        for url in claim.candidate_source_urls:
+            src = by_url.get(url)
+            if src is not None and (not found or src.credibility < best):
+                best = src.credibility
+                found = True
+        return best
+
+    async def _complete_guarded(
+        self, system: str, user: str, deadline: float, what: str
+    ) -> str | None:
+        """One llm.complete call under the verify deadline + per-call timeout budget
+        (same pattern as `_classify_one`). Returns None on timeout/error (fail-open)."""
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        budget = min(self._s.llm_timeout_s * 1.2 + 2.0, remaining)
+        try:
+            return await asyncio.wait_for(self._llm.complete(system, user),
+                                          timeout=budget)
+        except (TimeoutError, Exception) as e:
+            log.warning("verify(aligned): %s failed (%s) — skipping", what,
+                        type(e).__name__)
+            return None
+
+    async def _normalize_entities(self, claims: list[Claim], deadline: float) -> None:
+        """Batch-map entity aliases to canonical names via one llm.complete call; the
+        returned mapping rewrites claim.entity. Any failure leaves entities as-is."""
+        entities = sorted({c.entity for c in claims if c.entity})
+        if len(entities) < 2:
+            return
+        system = (
+            "You are an entity alias normalizer. Given a JSON list of entity names "
+            "extracted from research claims, map every alias to ONE canonical name "
+            "(e.g. \"CATL\" and \"宁德时代\" both map to \"宁德时代\"). Respond ONLY "
+            "as JSON: {\"mapping\": {\"<input name>\": \"<canonical name>\", ...}}. "
+            "Include every input name; map a name to itself when it has no alias."
+        )
+        raw = await self._complete_guarded(
+            system, json.dumps({"entities": entities}, ensure_ascii=False),
+            deadline, "entity normalization")
+        mapping = _safe_json_obj(raw or "").get("mapping")
+        if not isinstance(mapping, dict):
+            return
+        for c in claims:
+            if c.entity:
+                canonical = mapping.get(c.entity)
+                if isinstance(canonical, str) and canonical.strip():
+                    c.entity = canonical.strip()
+
+    async def _classify_clusters(
+        self, claims: list[Claim], by_url: dict[str, Source],
+        report: VerificationReport, deadline: float, emit,
+    ) -> dict[str, str]:
+        """Cluster structured claims by (entity, attribute) and tri-classify each
+        intra-cluster pair. Returns the dropped map (claim_id -> reason)."""
+        clusters: dict[tuple[str, str], list[Claim]] = {}
+        for c in claims:
+            if c.entity and c.attribute:
+                key = (c.entity.strip().lower(), c.attribute.strip().lower())
+                clusters.setdefault(key, []).append(c)
+        dropped: dict[str, str] = {}
+        checks_done = 0
+        for (_entity, _attribute), members in clusters.items():
+            if len(members) < 2:
+                continue
+            relation = "corroborate"
+            stop = False
+            for ai in range(len(members)):
+                for bi in range(ai + 1, len(members)):
+                    a, b = members[ai], members[bi]
+                    if a.id in dropped or b.id in dropped:
+                        continue
+                    if time.monotonic() >= deadline \
+                            or checks_done >= self._s.conflict_max_pair_checks:
+                        if time.monotonic() >= deadline:
+                            report.timed_out = True
+                        stop = True
+                        break
+                    budget = self._s.llm_timeout_s * 1.2 + 2.0
+                    try:
+                        verdict = await asyncio.wait_for(
+                            self._llm.check_contradiction(a.text, b.text),
+                            timeout=budget)
+                    except (TimeoutError, Exception) as e:
+                        # Fail-open: an unresolved pair is NOT a conflict.
+                        log.warning("verify(aligned): pair check failed (%s) — "
+                                    "keeping both", type(e).__name__)
+                        verdict = None
+                    checks_done += 1
+                    if verdict is not None and verdict.contradict:
+                        loser, winner = self._resolve_conflict(a, b, by_url)
+                        dropped[loser.id] = (
+                            f"dropped: contradicted by higher-authority claim "
+                            f"{winner.id} ({verdict.note})" if verdict.note else
+                            f"dropped: contradicted by higher-authority claim "
+                            f"{winner.id}")
+                        relation = "conflict"
+                    elif (a.qualifier or None) != (b.qualifier or None) \
+                            or (a.time_scope or None) != (b.time_scope or None):
+                        # COMPLEMENT: different calibre/period — BOTH claims kept.
+                        if relation != "conflict":
+                            relation = "complement"
+                        report.reasons[f"pair:{a.id}|{b.id}"] = (
+                            "complement: same entity/attribute but different "
+                            "qualifier/time_scope — both kept")
+                    else:
+                        # CORROBORATE: same calibre, consistent — merge evidence.
+                        self._merge_corroboration(a, b)
+                        report.reasons[f"pair:{a.id}|{b.id}"] = (
+                            "corroborate: same entity/attribute/calibre — "
+                            "evidence merged")
+                if stop:
+                    break
+            if len(members) >= 2:
+                report.clusters.append({
+                    "entity": members[0].entity,
+                    "attribute": members[0].attribute,
+                    "cells": [{
+                        "source_url": (m.candidate_source_urls[0]
+                                       if m.candidate_source_urls else ""),
+                        "value": m.value,
+                        "qualifier": m.qualifier,
+                        "credibility": (int(m.credibility)
+                                        if m.credibility is not None else None),
+                        "claim_text": m.text,
+                    } for m in members],
+                    "relation": relation,
+                })
+            emit(checks_done, self._s.conflict_max_pair_checks,
+                 f"Aligned cluster {_entity}/{_attribute}: {relation}")
+        return dropped
+
+    @staticmethod
+    def _merge_corroboration(a: Claim, b: Claim) -> None:
+        """Corroborating pair: union candidate URLs and evidence onto BOTH claims so
+        either one cites the full support set (deduped by source URL)."""
+        urls = list(dict.fromkeys(a.candidate_source_urls + b.candidate_source_urls))
+        ev: dict[str, Evidence] = {}
+        for e in a.evidence + b.evidence:
+            ev.setdefault(e.source_url, e)
+        for c in (a, b):
+            c.candidate_source_urls[:] = urls
+            c.evidence[:] = list(ev.values())
+
+    async def _check_unstructured_conflicts(
+        self, claims: list[Claim], by_url: dict[str, Source],
+        report: VerificationReport, deadline: float,
+        dropped: dict[str, str], emit,
+    ) -> None:
+        """Claims WITHOUT structured slots fall back to the conflict_only lexical path:
+        cheap overlap prefilter + contradiction oracle + authority resolution."""
+        sub = [c for c in claims if not (c.entity and c.attribute)]
+        if len(sub) < 2:
+            return
+        pairs = self._candidate_conflict_pairs(sub)
+        checks = min(len(pairs), self._s.conflict_max_pair_checks)
+        done = 0
+        for i, j in pairs[:checks]:
+            if time.monotonic() >= deadline:
+                report.timed_out = True
+                log.warning("verify(aligned): deadline hit after %d/%d unstructured "
+                            "pair checks", done, checks)
+                break
+            a, b = sub[i], sub[j]
+            if a.id in dropped or b.id in dropped:
+                continue
+            budget = self._s.llm_timeout_s * 1.2 + 2.0
+            try:
+                verdict = await asyncio.wait_for(
+                    self._llm.check_contradiction(a.text, b.text), timeout=budget)
+            except (TimeoutError, Exception) as e:
+                log.warning("verify(aligned): pair check failed (%s) — keeping both",
+                            type(e).__name__)
+                verdict = None
+            done += 1
+            if verdict is not None and verdict.contradict:
+                loser, winner = self._resolve_conflict(a, b, by_url)
+                dropped[loser.id] = (
+                    f"dropped: contradicted by higher-authority claim {winner.id} "
+                    f"({verdict.note})" if verdict.note else
+                    f"dropped: contradicted by higher-authority claim {winner.id}")
+            emit(done, checks, f"Checked unstructured conflict {done}/{checks}")
+
+    async def _review_isolated(
+        self, report: VerificationReport, by_url: dict[str, Source],
+        sources: list[Source], deadline: float, emit,
+    ) -> None:
+        """Review each isolated (孤证) claim: internal consistency, baseline deviation,
+        a provenance/timeliness source note, and (for core isolated claims) one round
+        of active verification. All fail-open; findings are recorded in reasons."""
+        isolated = [c for c in list(report.kept_claims) if c.isolated]
+        for c in isolated:
+            if time.monotonic() >= deadline:
+                report.timed_out = True
+                log.warning("verify(aligned): deadline hit during isolated review")
+                break
+            notes: list[str] = []
+            src = by_url.get(c.candidate_source_urls[0]) \
+                if c.candidate_source_urls else None
+
+            # (a) Internal consistency: do the numbers/relations inside the claim's
+            #     own source text hang together (数据勾稽)? Inconsistent -> downgrade.
+            if src is not None:
+                excerpt = retrieve_passages(c.text, src.text,
+                                            self._s.verify_passage_max_chars)
+                raw = await self._complete_guarded(
+                    "You are an internal consistency reviewer. Read the SOURCE excerpt "
+                    "and the CLAIM extracted from it. Check whether the numbers and "
+                    "relations in the source hang together (数据勾稽) and support the "
+                    "claim. Respond ONLY as JSON: {\"consistent\": bool, \"note\": "
+                    "\"<one short line>\"}.",
+                    f"CLAIM:\n{c.text}\n\nSOURCE:\n{excerpt}",
+                    deadline, "consistency check")
+                obj = _safe_json_obj(raw or "")
+                if obj.get("consistent") is False:
+                    c.credibility = self._downgrade(c.credibility)
+                    notes.append(
+                        f"internal inconsistency in source — credibility downgraded "
+                        f"to {c.credibility.label} ({obj.get('note', '')})".rstrip(" ()"))
+
+            # (b) Baseline deviation: domain-common-sense outlier score 0-1. Isolated
+            #     AND above threshold -> downgrade one level.
+            raw = await self._complete_guarded(
+                "You are a deviation assessor with domain common sense. Judge how far "
+                "the CLAIM deviates from the accepted baseline of its field "
+                "(0 = perfectly in line, 1 = extreme outlier). Respond ONLY as JSON: "
+                "{\"deviation\": <float 0-1>, \"note\": \"<one short line>\"}.",
+                f"CLAIM:\n{c.text}\nENTITY: {c.entity or 'n/a'}\n"
+                f"ATTRIBUTE: {c.attribute or 'n/a'}\nVALUE: {c.value or 'n/a'}",
+                deadline, "deviation assessment")
+            obj = _safe_json_obj(raw or "")
+            try:
+                deviation = float(obj.get("deviation")) if obj else None
+            except (TypeError, ValueError):
+                deviation = None
+            if deviation is not None and c.isolated \
+                    and deviation > self._s.alignment_deviation_threshold:
+                c.credibility = self._downgrade(c.credibility)
+                notes.append(
+                    f"deviation {deviation:.2f} exceeds threshold "
+                    f"{self._s.alignment_deviation_threshold:.2f} for an isolated "
+                    f"claim — credibility downgraded to {c.credibility.label} "
+                    f"({obj.get('note', '')})".rstrip(" ()"))
+
+            # (c) Source note: one line on timeliness (fetched_at) and domain
+            #     attributes. No extra network — metadata only.
+            if src is not None:
+                note = await self._complete_guarded(
+                    "You are a source note writer. Given a source's domain, title, and "
+                    "fetch timestamp, write ONE sentence assessing its timeliness and "
+                    "possible motivation/stance for a research report audit trail. "
+                    "Plain text, one sentence only.",
+                    f"DOMAIN: {src.domain}\nTITLE: {src.title}\n"
+                    f"FETCHED_AT: {src.fetched_at}\nCREDIBILITY: "
+                    f"{src.credibility.label}",
+                    deadline, "source note")
+                if note and note.strip():
+                    notes.append(f"source note: {note.strip()}")
+
+            # (d) Active verification for CORE isolated claims (entity known): one
+            #     bounded round of proxy-metric re-search that can lift isolation.
+            if c.isolated and c.entity and self._s.active_verify_enabled:
+                note = await self._active_verify(c, report, by_url, sources,
+                                                 deadline, emit)
+                if note:
+                    notes.append(note)
+
+            if notes:
+                prior = report.reasons.get(c.id)
+                report.reasons[c.id] = (prior + "; " if prior else "") + "; ".join(notes)
+
+    @staticmethod
+    def _downgrade(level: CredibilityLevel | None) -> CredibilityLevel:
+        """One credibility level weaker, floored at L4."""
+        return CredibilityLevel(min(4, int(level or CredibilityLevel.L3) + 1))
+
+    async def _active_verify(
+        self, claim: Claim, report: VerificationReport, by_url: dict[str, Source],
+        sources: list[Source], deadline: float, emit,
+    ) -> str | None:
+        """One-round active verification for a core isolated claim: generate up to
+        `active_verify_max_queries` proxy-metric queries, re-search them, fetch and
+        extract claims from NEW urls, and merge corroboration into this run's pool.
+        Returns an audit note, or None when nothing ran. NO recursion — claims found
+        here are never themselves actively verified."""
+        raw = await self._complete_guarded(
+            "You are a verification query generator. The CLAIM below is an isolated "
+            "single-source assertion. Propose up to "
+            f"{self._s.active_verify_max_queries} search queries for PROXY metrics or "
+            "independent sources that could corroborate or refute it. Respond ONLY as "
+            "a JSON array of query strings.",
+            f"CLAIM:\n{claim.text}\nENTITY: {claim.entity or 'n/a'}\n"
+            f"ATTRIBUTE: {claim.attribute or 'n/a'}\nVALUE: {claim.value or 'n/a'}",
+            deadline, "query generation")
+        queries = [q.strip() for q in _safe_json_list(raw or "[]")
+                   if isinstance(q, str) and q.strip()]
+        queries = queries[: self._s.active_verify_max_queries]
+        if not queries:
+            return None
+        search_fn = self._search_fn or self._default_search
+        budget = self._s.llm_timeout_s * 1.2 + 2.0
+        corroborated = False
+        for q in queries:
+            if time.monotonic() >= deadline:
+                report.timed_out = True
+                break
+            emit(0, 0, f"Active verification search: {q[:60]}")
+            try:
+                hits = await asyncio.wait_for(search_fn(q), timeout=budget)
+            except (TimeoutError, Exception) as e:
+                log.warning("verify(aligned): active search %r failed (%s)",
+                            q, type(e).__name__)
+                continue
+            for hit in hits[:3]:
+                if hit.url in by_url or self._fetcher is None:
+                    continue
+                try:
+                    text = await asyncio.wait_for(self._fetcher.fetch(hit.url),
+                                                  timeout=budget)
+                except (TimeoutError, Exception):
+                    continue
+                if not text:
+                    continue
+                src = Source(url=hit.url, domain=extract_domain(hit.url),
+                             title=hit.title, kind=classify(hit.url), text=text,
+                             credibility=credibility_for(hit.url))
+                by_url[hit.url] = src
+                sources.append(src)
+                try:
+                    extracted = await self._llm.extract_claims(hit.url, text)
+                except Exception as e:
+                    log.warning("verify(aligned): active extraction on %s failed (%s)",
+                                hit.url, type(e).__name__)
+                    continue
+                for ex in extracted:
+                    if self._merge_active_claim(ex, src, claim, report, by_url):
+                        corroborated = True
+        if corroborated:
+            claim.isolated = False
+            return ("active verification found corroborating source(s) — "
+                    "isolation lifted")
+        return f"active verification ran {len(queries)} query(ies); no corroboration found"
+
+    def _merge_active_claim(
+        self, ex, src: Source, target: Claim, report: VerificationReport,
+        by_url: dict[str, Source],
+    ) -> bool:
+        """Fold one actively-extracted claim into the pool: same normalized text extends
+        an existing claim; otherwise it becomes a new accepted claim. Returns True when
+        it corroborates the isolated target (same text, or same entity+attribute)."""
+        key = re.sub(r"[^a-z0-9 ]", "", ex.text.lower()).strip()
+        for c in report.kept_claims:
+            if re.sub(r"[^a-z0-9 ]", "", c.text.lower()).strip() != key:
+                continue
+            if src.url not in c.candidate_source_urls:
+                c.candidate_source_urls.append(src.url)
+                c.credibility = (src.credibility if c.credibility is None
+                                 else min(c.credibility, src.credibility))
+                c.evidence.append(Evidence(
+                    source_url=src.url, quote="", supports=True,
+                    note="accepted (active verification corroboration)"))
+            return c is target or (
+                c.entity and target.entity
+                and c.entity.lower() == target.entity.lower()
+                and c.attribute and target.attribute
+                and c.attribute.lower() == target.attribute.lower())
+        # New claim from the active round — accepted as fact like the rest of the pool.
+        claim = Claim(
+            id=f"av{len(report.kept_claims) + 1}",
+            text=ex.text,
+            candidate_source_urls=list(ex.candidate_source_urls),
+            credibility=src.credibility,
+            entity=ex.entity, attribute=ex.attribute, value=ex.value,
+            qualifier=ex.qualifier, time_scope=ex.time_scope,
+        )
+        self._accept_as_fact(claim, by_url)
+        report.kept_claims.append(claim)
+        report.claims_total += 1
+        report.claims_seen += 1
+        report.reasons[claim.id] = ("accepted via active verification of isolated "
+                                    f"claim {target.id}")
+        return bool(
+            claim.entity and target.entity
+            and claim.entity.lower() == target.entity.lower()
+            and claim.attribute and target.attribute
+            and claim.attribute.lower() == target.attribute.lower())
+
+    async def _default_search(self, query: str):
+        """Active-verification search through the query router (lazy import: router.py
+        depends on the scrape factory, and verify.py must not create a cycle)."""
+        from core_engine.report.router import routed_search
+
+        return await routed_search(query, self._llm,
+                                   max_results=self._s.scrape_max_results)
+
     async def _verify_cross_reference(
         self, claims: list[Claim], sources: list[Source], *, on_progress=None,
     ) -> VerificationReport:
@@ -468,7 +986,7 @@ class VerificationHarness:
             grace = self._s.verify_deadline_s + self._s.llm_timeout_s + 5.0
             gathered = await asyncio.wait_for(asyncio.gather(*tasks), timeout=grace)
             results = list(gathered)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             report.timed_out = True
             log.warning("verify: hard grace deadline hit — collecting finished claims")
             for t in tasks:
@@ -595,10 +1113,7 @@ class VerificationHarness:
         # Relaxed tiering: high-trust endorsement or multi-domain -> HIGH; consistent
         # 2nd domain -> CORROBORATED; a single credible source -> LIKELY (reportable);
         # only a lone low-trust signal stays RUMOR.
-        if supported_high_trust and n >= self._s.high_confidence_min_domains:
-            claim.confidence = ConfidenceTier.HIGH
-            claim.verified = True
-        elif supported_high_trust:
+        if supported_high_trust and n >= self._s.high_confidence_min_domains or supported_high_trust:
             claim.confidence = ConfidenceTier.HIGH
             claim.verified = True
         elif n >= self._s.high_confidence_min_domains:
@@ -655,7 +1170,7 @@ class VerificationHarness:
             # traceable mode
             j = await asyncio.wait_for(
                 self._llm.check_traceability(claim_text, excerpt), timeout=budget)
-        except (asyncio.TimeoutError, Exception) as e:
+        except (TimeoutError, Exception) as e:
             # Timed out / errored -> treat as no support (NOT a hallucination), log, move on.
             log.warning("verify: check on %s timed out/failed (%s) — skipping",
                         src.url, type(e).__name__)

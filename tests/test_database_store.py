@@ -7,8 +7,6 @@ the real per-user directory. Offline, no network.
 """
 from __future__ import annotations
 
-from pathlib import Path
-
 import pytest
 
 from core_engine.report.models import Source, SourceKind
@@ -82,7 +80,7 @@ def test_sources_for_comprehensive_combines_brief_and_articles(temp_db):
     assert SourceKind.INDUSTRY_INSTITUTION in kinds
     assert SourceKind.USER_PROVIDED in kinds
     # The user doc carries its parsed text and a synthetic addressable URL.
-    user = [s for s in pool if s.kind is SourceKind.USER_PROVIDED][0]
+    user = next(s for s in pool if s.kind is SourceKind.USER_PROVIDED)
     assert user.text == "user body text"
     assert user.url.startswith("userdoc://")
 

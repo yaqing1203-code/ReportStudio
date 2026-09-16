@@ -1,6 +1,12 @@
 # Compliance Checker Agent — validates the drafted answer before it leaves the system.
 # This is the OUTPUT guardrail seam (§5.3): PII/policy checks run here, after
 # synthesis, on the way out. It can strip or flag, then hand to the critic.
+#
+# KNOWN ISSUE (dormant layer, untested): this manifest references the tools
+# `policy_lookup` and `pii_scan`, which do NOT exist in the default tool registry.
+# This data-agent layer is dormant after the report-generation pivot and has not
+# been run end-to-end; these tools must be registered (or the references removed)
+# before this agent can actually execute.
 name: compliance_checker
 description: >
   Reviews the drafted answer for policy violations, PII/PHI leakage, and

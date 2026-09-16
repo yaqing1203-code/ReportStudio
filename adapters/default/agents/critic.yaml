@@ -1,6 +1,12 @@
 # Critic / Verifier Agent — the final anti-hallucination grounding pass (§3.4, §5.3).
 # A dedicated verification step is one of the most effective grounding mechanisms:
 # it checks that every claim actually maps to a cited source before release.
+#
+# KNOWN ISSUE (dormant layer, untested): this manifest references the tool
+# `citation_verify`, which does NOT exist in the default tool registry. This
+# data-agent layer is dormant after the report-generation pivot and has not been
+# run end-to-end; the tool must be registered (or the reference removed) before
+# this agent can actually execute.
 name: critic
 description: >
   Adversarially verifies the final answer against its citations. For every factual

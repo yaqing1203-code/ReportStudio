@@ -13,13 +13,13 @@ carries the full audit trail either way.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from enum import Enum
+from datetime import UTC, datetime
+from enum import Enum, IntEnum
 from typing import Any
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 class SourceKind(str, Enum):
@@ -52,6 +52,43 @@ class SourceKind(str, Enum):
         )
 
 
+class CredibilityLevel(IntEnum):
+    """Source credibility grading (L1-L4), orthogonal to SourceKind.
+
+    SourceKind answers "which curated bucket admitted this URL"; CredibilityLevel
+    answers "how much weight should this source carry when ranking and when
+    judging isolated (single-source) claims".
+
+      L1 — authoritative anchor: official releases, audited filings, legal
+           instruments, national standards, top-tier academic venues.
+      L2 — professional endorsement: leading media, think tanks, listed-company
+           disclosures, research houses.
+      L3 — industry consensus: trade associations, mainstream in-depth self-media,
+           expert interviews; the default for unrecognized-but-allowed sites.
+      L4 — weak-signal / isolated evidence: personal blogs, anonymous forums,
+           unattributed material. Never ranked ahead of L1/L2 anchors.
+    """
+
+    L1 = 1
+    L2 = 2
+    L3 = 3
+    L4 = 4
+
+    @property
+    def weight(self) -> float:
+        """Ranking weight: higher credibility -> larger weight."""
+        return {1: 1.0, 2: 0.8, 3: 0.5, 4: 0.2}[int(self)]
+
+    @property
+    def label(self) -> str:
+        return {
+            1: "L1 Authoritative Anchor",
+            2: "L2 Professional Endorsement",
+            3: "L3 Industry Consensus",
+            4: "L4 Weak Signal / Isolated",
+        }[int(self)]
+
+
 @dataclass(slots=True)
 class SearchHit:
     """A raw search-engine result, before filtering. Cheap: URL + snippet only."""
@@ -72,6 +109,10 @@ class Source:
     kind: SourceKind
     text: str                         # extracted main content (not raw HTML)
     fetched_at: str = field(default_factory=_now)
+    # Credibility grade (L1-L4) assigned at gather time via sources.credibility_for().
+    # Defaults to L3 (industry consensus) so pre-existing constructions keep a
+    # neutral weight in the credibility-weighted ranking.
+    credibility: CredibilityLevel = CredibilityLevel.L3
 
     @property
     def authoritative(self) -> bool:
@@ -131,6 +172,19 @@ class Claim:
     real fetched source and NOT flagged as hallucinated (a source contradicting it or
     asserting facts no source supports). Its `confidence` tier records how well it is
     corroborated, so the report can separate verified facts from rumors.
+
+    Structured-slot semantics (filled by the alignment/fusion layer, all optional):
+      entity      — the subject the claim is about (normalized name, e.g. a company).
+      attribute   — the measured/claimed property (e.g. "market_share", "revenue").
+      value       — the claimed value as stated (e.g. "32%").
+      qualifier   — scope/calibre qualifiers (口径: e.g. "GAAP", "domestic only").
+      time_scope  — the period the claim refers to (e.g. "FY2023").
+    When extraction cannot fill the slots they stay None and the claim degrades to a
+    plain-text statement handled by the lexical paths.
+      credibility — credibility of the claim's (strongest) supporting source; None
+                    until the verification layer assigns it.
+      isolated    — True for 孤证: supported by a single source whose credibility is
+                    L3 or weaker. Isolated claims get hedged wording in the report.
     """
 
     id: str
@@ -140,7 +194,17 @@ class Claim:
     evidence: list[Evidence] = field(default_factory=list)
     verified: bool = False                       # True for HIGH/CORROBORATED tiers
     verification_rounds: int = 0
-    confidence: "ConfidenceTier | None" = None    # set by the harness
+    confidence: ConfidenceTier | None = None    # set by the harness
+    # Credibility / isolation grading (see class docstring). Filled by the
+    # verification/alignment layer; None / False until then.
+    credibility: CredibilityLevel | None = None
+    isolated: bool = False
+    # Structured slots (entity-attribute-value), all optional — see class docstring.
+    entity: str | None = None
+    attribute: str | None = None
+    value: str | None = None
+    qualifier: str | None = None
+    time_scope: str | None = None
 
     def supporting_sources(self) -> list[str]:
         """Distinct source URLs with confirmed supporting evidence."""
@@ -184,7 +248,7 @@ class ReportSection:
     latex_blocks: list[str] = field(default_factory=list)
     # Deep-dive analytical insights attached to this section (may be empty). Rendered
     # as titled subsections after the main prose + charts.
-    deep_dives: list["DeepDive"] = field(default_factory=list)
+    deep_dives: list[DeepDive] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -229,6 +293,14 @@ class PipelineStatus(str, Enum):
 
 # The exact user-facing message mandated by the spec for the out-of-scope case.
 OUT_OF_SCOPE_MESSAGE = "This topic is outside my current business scope."
+OUT_OF_SCOPE_MESSAGE_ZH = "该主题超出我目前的业务范围。"
+
+
+def out_of_scope_message(locale: str = "en") -> str:
+    """Locale-aware out-of-scope message; defaults to the mandated English text."""
+    if (locale or "en").lower().startswith("zh"):
+        return OUT_OF_SCOPE_MESSAGE_ZH
+    return OUT_OF_SCOPE_MESSAGE
 
 
 @dataclass(slots=True)

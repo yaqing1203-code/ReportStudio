@@ -22,7 +22,7 @@ from typing import Any, Protocol
 
 import yaml
 
-from core_engine.gateway.router import CallBudget, ToolResult, ToolRouter
+from core_engine.gateway.router import CallBudget, ToolRouter
 from core_engine.security.context import RequestContext
 
 
@@ -64,7 +64,7 @@ class AgentManifest:
     model: str = "claude-opus-4-8"
 
     @classmethod
-    def from_yaml(cls, path: Path) -> "AgentManifest":
+    def from_yaml(cls, path: Path) -> AgentManifest:
         raw = yaml.safe_load(path.read_text(encoding="utf-8"))
         prompt_ref = raw.get("system_prompt_ref")
         prompt = raw.get("system_prompt", "")

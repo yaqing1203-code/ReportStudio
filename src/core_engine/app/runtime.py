@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+from datetime import UTC
 from pathlib import Path
 
 APP_DIR_NAME = "CoreEngineReports"
@@ -37,13 +38,18 @@ _SETTINGS_TO_ENV = {
     "anthropic_api_key": "CE_ANTHROPIC_API_KEY",
     "search_provider": "CE_SEARCH_PROVIDER",
     "search_api_key": "CE_SEARCH_API_KEY",
+    "firecrawl_api_key": "CE_FIRECRAWL_API_KEY",
+    "jina_api_key": "CE_JINA_API_KEY",
+    "search_router_enabled": "CE_SEARCH_ROUTER_ENABLED",
     "verify_mode": "CE_VERIFY_MODE",
     "latex_engine": "CE_LATEX_ENGINE",
+    "hitl_on_isolated_core_claim": "CE_HITL_ON_ISOLATED_CORE_CLAIM",
 }
 
 # Keys we treat as secret: never returned to the frontend in cleartext, stored in a
 # user-only file. The GUI shows whether a key is SET, not the value itself.
-_SECRET_KEYS = {"llm_api_key", "anthropic_api_key", "search_api_key"}
+_SECRET_KEYS = {"llm_api_key", "anthropic_api_key", "search_api_key",
+                "firecrawl_api_key", "jina_api_key"}
 
 
 def is_frozen() -> bool:
@@ -112,11 +118,8 @@ def store_pdf(report_id: str, source_pdf: Path, topic: str = "") -> Path:
 
     source_pdf = Path(source_pdf)
     dest = generated_pdfs_dir() / f"{report_id}.pdf"
-    try:
-        if source_pdf.resolve() != dest.resolve():
-            shutil.copyfile(source_pdf, dest)
-    except FileNotFoundError:
-        raise
+    if source_pdf.resolve() != dest.resolve():
+        shutil.copyfile(source_pdf, dest)
     index = _load_pdf_index()
     index[report_id] = {
         "pdf": str(dest),
@@ -142,15 +145,15 @@ def lookup_pdf(report_id: str) -> Path | None:
 
 
 def _now_iso() -> str:
-    from datetime import datetime, timezone
-    return datetime.now(timezone.utc).isoformat()
+    from datetime import datetime
+    return datetime.now(UTC).isoformat()
 
 
 def bundled_resource(rel: str) -> Path:
     """Resolve a path to a resource that was bundled into the .exe (templates, the
     web UI, the tectonic binary). Works both frozen (sys._MEIPASS) and from source."""
     if is_frozen():
-        base = Path(getattr(sys, "_MEIPASS"))
+        base = Path(sys._MEIPASS)
     else:
         # src/core_engine/app/runtime.py -> repo root is parents[3]
         base = Path(__file__).resolve().parents[3]

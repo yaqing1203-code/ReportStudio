@@ -2,7 +2,7 @@
 patterns: relational (source of truth), AGE (graph), pgvector (embeddings)."""
 from __future__ import annotations
 
-from typing import AsyncIterator
+from collections.abc import AsyncIterator
 
 import psycopg
 from psycopg_pool import AsyncConnectionPool

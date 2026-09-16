@@ -33,7 +33,7 @@ class PropertyDef(BaseModel):
     values: list[str] = Field(default_factory=list)  # only for dtype == enum
 
     @model_validator(mode="after")
-    def _check_enum(self) -> "PropertyDef":
+    def _check_enum(self) -> PropertyDef:
         if self.dtype is DType.enum and not self.values:
             raise ValueError(f"enum property '{self.name}' must declare values")
         return self
@@ -81,7 +81,7 @@ class MappingRule(BaseModel):
     column_map: dict[str, str]
     primary_key: str
     # Foreign keys become typed edges.
-    edges: list["EdgeMappingRule"] = Field(default_factory=list)
+    edges: list[EdgeMappingRule] = Field(default_factory=list)
 
 
 class EdgeMappingRule(BaseModel):
@@ -124,7 +124,7 @@ class Ontology(BaseModel):
         return [r.type for r in self.relationships if r.transitive]
 
     @model_validator(mode="after")
-    def _validate_references(self) -> "Ontology":
+    def _validate_references(self) -> Ontology:
         types = {e.type for e in self.entities}
         for r in self.relationships:
             for endpoint in (r.from_, r.to):

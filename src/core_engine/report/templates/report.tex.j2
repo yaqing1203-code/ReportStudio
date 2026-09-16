@@ -7,6 +7,11 @@
 %% Engine: xelatex (Unicode + system fonts). Falls back to pdflatex-safe packages.
 \documentclass[11pt,a4paper]{article}
 
+<% if locale == "zh" %>
+%% --- Chinese locale: ctex provides CJK fonts/typography (xelatex/xeCJK) --------
+\usepackage{ctex}
+<% endif %>
+
 %% --- Encoding / fonts (xelatex-friendly, pdflatex-safe fallback) -------------
 \usepackage{iftex}
 \ifPDFTeX
