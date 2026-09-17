@@ -1,0 +1,31 @@
+# Compliance Checker Agent — validates the drafted answer before it leaves the system.
+# This is the OUTPUT guardrail seam (§5.3): PII/policy checks run here, after
+# synthesis, on the way out. It can strip or flag, then hand to the critic.
+#
+# KNOWN ISSUE (dormant layer, untested): this manifest references the tools
+# `policy_lookup` and `pii_scan`, which do NOT exist in the default tool registry.
+# This data-agent layer is dormant after the report-generation pivot and has not
+# been run end-to-end; these tools must be registered (or the references removed)
+# before this agent can actually execute.
+name: compliance_checker
+description: >
+  Reviews the drafted answer for policy violations, PII/PHI leakage, and
+  disallowed content before release. Can redact or reject. Enforces that the
+  answer stays within the bounds of the retrieved evidence.
+system_prompt: |
+  You are the Compliance Checker Agent. You are the last policy gate before an
+  answer is returned. Rules:
+  - Scan the drafted answer for PII/PHI that is not essential to the question and
+    redact it.
+  - Reject any statement that is not supported by a citation URI on the blackboard.
+  - Flag any content that violates the vertical's policy set (loaded from the
+    adapter layer). If you cannot make the answer compliant, set status "error".
+  - When the answer is clean, hand off to `critic` for a final grounding check.
+tools:
+  - policy_lookup
+  - pii_scan
+handoff_targets:
+  - critic
+  - orchestrator
+max_tool_calls: 6
+model: claude-opus-4-8

@@ -1,0 +1,176 @@
+%% Formal report template — core-engine report pipeline.
+%% Rendered by report/latex.py (Jinja2 with custom delimiters so it never
+%% collides with LaTeX's own {{ }} / {% %}). Compiled by scripts/compile.py.
+%%
+%% Design goals: formal business/academic standard — clean typography, generous
+%% margins, running headers, professional title block, well-formatted source table.
+%% Engine: xelatex (Unicode + system fonts). Falls back to pdflatex-safe packages.
+\documentclass[11pt,a4paper]{article}
+
+<% if locale == "zh" %>
+%% --- Chinese locale: ctex provides CJK fonts/typography (xelatex/xeCJK) --------
+\usepackage{ctex}
+<% endif %>
+
+%% --- Encoding / fonts (xelatex-friendly, pdflatex-safe fallback) -------------
+\usepackage{iftex}
+\ifPDFTeX
+  \usepackage[utf8]{inputenc}
+  \usepackage[T1]{fontenc}
+  \usepackage{lmodern}
+\else
+  \usepackage{fontspec}
+\fi
+
+%% --- Layout ------------------------------------------------------------------
+\usepackage[a4paper,margin=1in,headheight=14pt]{geometry}
+\usepackage{microtype}          % refined justification / kerning
+\usepackage{setspace}
+\onehalfspacing
+\usepackage{parskip}            % space between paragraphs, no indent
+\usepackage{titlesec}
+\usepackage{fancyhdr}
+\usepackage{booktabs}           % professional tables (\toprule etc.)
+\usepackage{longtable}          % multi-page source table
+\usepackage{array}
+\usepackage{xcolor}
+\usepackage{graphicx}
+\usepackage{float}
+%% --- Charts: TikZ (chain flowchart) + pgfplots (market/share charts) ---------
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta, positioning, shapes.geometric, fit, backgrounds}
+\usepackage{pgfplots}
+\pgfplotsset{compat=1.17}
+\usepackage{hyperref}
+\usepackage{enumitem}
+
+%% --- Colours / links ---------------------------------------------------------
+\definecolor{primary}{RGB}{28,52,94}      % deep navy
+\definecolor{accent}{RGB}{120,130,145}    % muted slate
+\hypersetup{
+  colorlinks=true, linkcolor=primary, urlcolor=primary, citecolor=primary,
+  pdftitle={<< title | tex >>}, pdfauthor={core-engine report pipeline}
+}
+
+%% --- Section styling ---------------------------------------------------------
+\titleformat{\section}{\Large\bfseries\color{primary}}{\thesection}{0.7em}{}
+\titleformat{\subsection}{\large\bfseries\color{primary}}{\thesubsection}{0.6em}{}
+\titlespacing*{\section}{0pt}{1.4em}{0.6em}
+
+%% --- Running header / footer -------------------------------------------------
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{\small\color{accent}<< title | tex | truncate(60) >>}
+\fancyhead[R]{\small\color{accent}\thepage}
+\renewcommand{\headrulewidth}{0.4pt}
+\renewcommand{\headrule}{\hbox to\headwidth{\color{accent}\leaders\hrule height \headrulewidth\hfill}}
+
+\begin{document}
+
+%% --- Title block -------------------------------------------------------------
+\begin{titlepage}
+  \centering
+  \vspace*{2cm}
+  {\color{accent}\large\scshape Research Report\par}
+  \vspace{1.2cm}
+  {\color{primary}\Huge\bfseries << title | tex >>\par}
+  \vspace{0.6cm}
+  {\color{accent}\rule{0.5\textwidth}{0.8pt}\par}
+  \vspace{1.5cm}
+  \begin{minipage}{0.8\textwidth}
+    \centering\itshape\large << abstract | tex >>
+  \end{minipage}
+  \vfill
+  {\color{accent}\small Generated << generated_at | tex >> \\
+   Compiled from << source_count >> source(s): a mix of high-trust outlets
+   (government, research houses, industry institutions, non-profits, and
+   established media) and other public web sources.\par}
+  \vspace{1cm}
+\end{titlepage}
+
+%% --- Provenance notice -------------------------------------------------------
+\thispagestyle{fancy}
+\section*{Methodology \& Provenance}
+This report was assembled by an automated pipeline that gathered information from a
+broad mix of public sources. These range from high-trust outlets — government and
+inter-governmental bodies, investment-bank and research-house reports, recognised
+industry institutions, established non-profit research organisations, and mainstream
+media with editorial standards — through to other general web sources admitted for
+coverage. Sources are weighted by trust: findings endorsed by high-trust outlets or
+corroborated across multiple independent domains are reported as verified, while
+material resting on a single or lower-trust source is either labelled accordingly or
+separated into the \emph{Unverified Signals \& Rumors} section. Every verified
+finding below was cross-referenced across at least << min_sources >> independent
+domain(s) under the \emph{<< verify_mode | tex >>} verification contract
+(<< verify_rounds >> rounds). The structured sections (Industry Chain Map, Market
+Size, Competitive Landscape) are generated from a knowledge graph whose every node,
+edge, and figure traces back to a verified claim. Findings that could not be traced
+to any source were discarded and do not appear here.
+
+\tableofcontents
+\newpage
+
+%% --- Body: the 5 mandated sections; prose, KG-driven charts, then deep dives --
+<% for section in sections %>
+\section{<< section.heading | tex >>}
+<% for para in section.paragraphs %>
+<< para | tex >>
+
+<% endfor %>
+<% for block in section.latex_blocks %>
+%% chart/table block — figure floats [H] so long sections don't push it adrift
+\begin{figure}[H]
+\centering
+<< block >>
+\end{figure}
+
+<% endfor %>
+<% if section.deep_dives %>
+%% Deep-dive analytical insights (multi-paragraph, grounded in verified claims)
+<% for dive in section.deep_dives %>
+\subsection{<< dive.title | tex >>}
+<% for para in dive.paragraphs %>
+<< para | tex >>
+
+<% endfor %>
+<% endfor %>
+<% endif %>
+<% endfor %>
+
+%% --- Unverified signals & rumors (single-source, uncorroborated) -------------
+%% Kept per the broad-collection model, but clearly separated from verified facts.
+<% if rumors %>
+\newpage
+\section{Unverified Signals \& Rumors}
+\addcontentsline{toc}{section}{Unverified Signals \& Rumors}
+\emph{The items below come from a single source and were \textbf{not} corroborated by
+independent or high-trust outlets. They are included as early signals and should be
+treated as unverified — they are excluded from the verified analysis and charts above.}
+
+\begin{itemize}[leftmargin=1.4em]
+<% for r in rumors %>
+  \item << r.text | tex >>~\textsuperscript{[unverified]}
+<% endfor %>
+\end{itemize}
+<% endif %>
+
+%% --- Sources / bibliography -------------------------------------------------
+\newpage
+\section*{Sources}
+\addcontentsline{toc}{section}{Sources}
+The sources cited below span high-trust outlets and other public web sources; each
+was screened against the source filter before use.
+
+\begin{longtable}{@{}p{0.34\textwidth}p{0.60\textwidth}@{}}
+\toprule
+\textbf{Publisher / Domain} & \textbf{Title \& URL} \\
+\midrule
+\endhead
+<% for src in sources %>
+<< src.domain | tex >> & << src.title | tex >>\newline \url{<< src.url >>} \\
+\addlinespace
+<% endfor %>
+\bottomrule
+\end{longtable}
+
+\end{document}

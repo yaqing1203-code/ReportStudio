@@ -13,23 +13,46 @@ ReportStudio combines intelligent web scraping, strict source verification, know
 - **Report Mode** — Full research pipeline with multi-source verification and PDF generation
 
 ```text
-topic → search → STRICT filter → fetch → extract claims
-      → VERIFY (triple-check + cross-reference) → [scope gate]
-      → synthesize KG + deep-dive analysis → assemble (5 sections)
-      → LaTeX (TikZ/pgfplots/booktabs) → compile PDF
+topic → search router (query-type backend chain + disk cache)
+      → STRICT filter → fetch → extract claims (structured slots)
+      → VERIFY (aligned: entity clustering + isolated-claim review)
+      → [optional HITL confirmation gate] → [scope gate]
+      → synthesize KG + deep-dive analysis → assemble (5 + 2 sections)
+      → LaTeX (TikZ/pgfplots/booktabs/comparison matrix) → compile PDF
 ```
 
 ## ✨ Key Features
 
 ### Verification Harness
-Every claim must pass a strict verification gate with configurable strategies:
-- **`traceable`** (default) — Claims fully supported by authoritative sources with cross-domain corroboration
-- **`strict`** — Every claim requires verbatim spans from authoritative sources
-- **Triple-check** — Multiple independent verification rounds per claim
-- **Cross-referencing** — Minimum distinct authoritative domains required
+Every claim passes through a configurable verification gate:
+- **`aligned`** (default) — Entity alignment + fusion: structured claims are clustered by (entity, attribute), intra-cluster pairs are classified as corroborate/complement/conflict, and isolated single-source claims get a dedicated review
+- **`conflict_only`** — Fast path: accept all claims, resolve only direct contradictions
+- **`cross_reference`** — Legacy strict model: every claim traced against its sources and the whole pool
+- **`traceable` / `strict` verification modes** — Whether paraphrase support suffices or verbatim spans are mandatory
 - **Out-of-scope fallback** — Pipeline halts rather than guessing when insufficient sources found
 
-### Report Structure (5 Mandated Sections)
+### Search Router
+No single search backend serves every query shape well, so each query is classified and routed:
+- **Six query types** — `fact`, `deep_research`, `chinese`, `structured`, `academic`, `general`
+- **Rule short-circuit + LLM tiebreak** — deterministic rules classify first; the LLM only breaks ties and any failure degrades gracefully to `general`
+- **Backend fallback chains** — e.g. `structured` → Firecrawl → Tavily → DuckDuckGo; an unavailable backend falls through to the next entry
+- **On-disk search cache** — TTL'd JSON cache (default 24 h) keyed by backend + query, atomic writes
+
+See [Search Router](#-search-router) below for the full routing table.
+
+### Source Credibility Grading (L1–L4)
+Beyond the allowlist gate, every kept source is graded L1–L4 and that grade drives ranking, conflict resolution, and isolated-claim review:
+
+| Level | Weight | Definition | Typical sources | Handling |
+|-------|--------|------------|-----------------|----------|
+| **L1** | 1.0 | Authoritative anchor | Government, regulators, standards bodies, top academic venues | Ranking anchors; never outranked by weak sources |
+| **L2** | 0.8 | Professional endorsement | Leading media, investment banks / research houses, think tanks, user-provided documents | High-trust; wins conflicts vs. L3/L4 |
+| **L3** | 0.5 | Industry consensus | Trade media, expert interviews; default for unrecognized-but-allowed sites | Single-source L3 claims are marked isolated and reviewed |
+| **L4** | 0.2 | Weak signal | Personal blogs, anonymous forums, unattributed material | Never ranked ahead of L1/L2; dagger (†) marker in the comparison matrix |
+
+Kept sources are ordered by `relevance × 0.5 + credibility × 0.35 + freshness × 0.15` (weights tunable via `CE_RANK_W_*`).
+
+### Report Structure (5 Mandated Sections + Synthesis Layer)
 Every report follows a standardized structure backed by knowledge graphs:
 1. **Industry Overview** — Comprehensive sector analysis
 2. **Policy Analysis** — Regulatory landscape and implications
@@ -37,19 +60,34 @@ Every report follows a standardized structure backed by knowledge graphs:
 4. **Market Size** — pgfplots charts with historical data + TAM/SAM/SOM tables
 5. **Competitive Landscape** — booktabs tables + market share visualizations
 
-### Source Quality Control
-Strict allowlist-based filtering:
-- ✅ Government agencies & IGOs
-- ✅ Investment banks & research houses
-- ✅ Academic institutions (.edu)
-- ✅ Industry institutions & non-profit research orgs
-- ✅ Mainstream media outlets
-- ❌ Blogs, forums, social media, tabloids (rejected before download)
+When `CE_ENABLE_SYNTHESIS_SECTIONS=true` (default) two more sections are appended:
+6. **Source Comparison & Divergence** — LLM-drafted analysis of where sources agree/disagree, backed by a **booktabs comparison matrix** (one row per (entity, attribute), one column per source; L4-backed cells carry a † marker). Only emitted when alignment clusters exist.
+7. **Information Limitations** — Deterministic closing section stating what the available sources could and could not establish.
+
+`CE_REPORT_LOCALE=zh` localizes all headings, the title, and the out-of-scope message, and switches the LaTeX preamble to `ctex`.
+
+### Isolated-Claim (孤证) Handling
+A claim backed by a *single* source at credibility L3/L4 is flagged **isolated** and gets four layers of scrutiny (all fail-open):
+1. **Internal consistency** — self-contradiction check within the claim
+2. **Baseline deviation** — an LLM-scored deviation from domain common sense; above `CE_ALIGNMENT_DEVIATION_THRESHOLD` (default 0.6) the claim is downgraded one credibility level
+3. **Provenance / timeliness note** — a source note recording where the claim comes from and any timeliness or motivation caveats
+4. **Active verification** (optional, `CE_ACTIVE_VERIFY_ENABLED`, default on) — up to `CE_ACTIVE_VERIFY_MAX_QUERIES` (default 3) proxy-metric queries are generated and re-searched through the router in ONE bounded round; corroborating hits can lift the isolated flag
+
+Isolated claims that survive are rendered with hedged language: claim lines marked `[UNVERIFIED - single source]` force explicit attribution ("According to a single source, …") in the drafted prose.
+
+### Human-in-the-Loop Review (optional)
+Set `CE_HITL_ON_ISOLATED_CORE_CLAIM=true` to pause the pipeline after verification whenever at least one **core isolated claim** survived (single source, credibility L3 or stronger):
+
+- The run emits an `awaiting_confirmation` SSE event carrying a JSON summary of the claims, and the UI shows a confirmation card.
+- A human decides via `POST /api/jobs/{job_id}/confirm` with `{"decision": "continue" | "abort"}`.
+- The gate times out after 600 s and defaults to **continue**; **abort** halts the run with status `BLOCKED`.
+- Default is **off** — runs proceed unattended.
 
 ### Desktop Application
 - **Native UI** — pywebview-based chat interface
 - **Zero-setup PDF** — Bundled Tectonic LaTeX compiler (no system TeX required)
 - **Keyless search** — DuckDuckGo integration (no API key needed)
+- **Loopback session token** — per-launch random token guards `/api/*` against other local processes
 - **Persistent settings** — API configurations saved locally
 - **Real-time progress** — SSE streaming of pipeline stages
 
@@ -82,6 +120,8 @@ export CE_SEARCH_API_KEY=tvly-...
 export CE_VERIFY_MODE=traceable  # 'traceable' (default) or 'strict'
 ```
 
+See [.env.example](.env.example) for the full, commented variable list.
+
 ## 📦 Building from Source
 
 ### Prerequisites
@@ -91,8 +131,8 @@ export CE_VERIFY_MODE=traceable  # 'traceable' (default) or 'strict'
 conda create -n py311 python=3.11 -y
 conda activate py311
 
-# Install dependencies
-cd core-engine
+# Install dependencies (run from the repository root — it IS the project root;
+# the package lives under src/core_engine/)
 pip install -e ".[app]"
 pip install pyinstaller
 ```
@@ -122,27 +162,29 @@ python -m PyInstaller packaging/ReportStudio.spec --clean --noconfirm
 ```
 src/core_engine/
 ├── report/                      # Report generation pipeline (active)
-│   ├── models.py               # Data models for all stages
-│   ├── sources.py              # Strict source allowlist
-│   ├── scrape.py               # Search & fetch (DuckDuckGo/Tavily)
-│   ├── llm.py                  # LLM operations (Anthropic/OpenAI)
-│   ├── verify.py               # Verification harness (traceable / strict)
+│   ├── models.py               # Data models for all stages (incl. CredibilityLevel L1-L4)
+│   ├── sources.py              # Strict source allowlist + credibility_for() grading
+│   ├── scrape.py               # Search & fetch (DuckDuckGo/Tavily/Firecrawl/Jina/fake)
+│   ├── router.py               # Search Router: query-type classification + backend chains
+│   ├── search_cache.py         # On-disk TTL cache for search results (atomic writes)
+│   ├── llm.py                  # LLM operations (Anthropic/OpenAI) + hedging rules
+│   ├── verify.py               # Verification harness (aligned / conflict_only / cross_reference)
 │   ├── kg.py                   # Knowledge graph synthesis
-│   ├── charts.py               # LaTeX chart generation
-│   ├── pipeline.py             # Orchestration & gates
-│   ├── latex.py                # LaTeX rendering with Jinja2
+│   ├── charts.py               # LaTeX chart generation (incl. comparison matrix)
+│   ├── pipeline.py             # Orchestration, gates, HITL ConfirmationGate
+│   ├── latex.py                # LaTeX rendering with Jinja2 (collision-proof filenames)
 │   ├── compile.py              # PDF compilation (Tectonic/xelatex)
 │   ├── cli.py                  # CLI entry: `python -m core_engine.report.cli`
 │   ├── documents.py            # Uploaded-document parsing (PDF/DOCX/XLSX)
 │   └── templates/report.tex.j2 # LaTeX template
 ├── app/                         # Desktop application (pywebview + FastAPI)
-│   ├── shell.py                # Entry point + pywebview window
-│   ├── server.py               # FastAPI backend
+│   ├── shell.py                # Entry point + pywebview window (issues session token)
+│   ├── server.py               # FastAPI backend (loopback token middleware, HITL confirm API)
 │   ├── runtime.py              # Settings persistence
 │   ├── intent.py               # Chat/report routing
 │   ├── conversation.py         # Chat-mode conversation state
-│   ├── database.py             # SQLite-backed session store
-│   └── history.py              # Report run history
+│   ├── database.py             # JSON-file session store
+│   └── history.py              # Report run history (atomic writes)
 ├── agents/                      # Agent abstractions (base classes)
 ├── gateway/                     # Tool router (LLM tool-calling layer)
 ├── ontology/                    # YAML schema loader
@@ -153,7 +195,7 @@ src/core_engine/
 │   ├── graph.py                #   Apache AGE knowledge graph
 │   ├── vector.py               #   pgvector embeddings
 │   └── postgres.py             #   SQLAlchemy + psycopg
-├── config.py                    # pydantic-settings configuration
+├── config.py                    # pydantic-settings configuration (single source of truth)
 └── embeddings.py                # fastembed (BGE-M3) wrapper
 
 adapters/default/                # Domain config (ontology + agent YAMLs)
@@ -171,7 +213,7 @@ db/init/                         # Postgres init SQL (runs on first docker-compo
 
 web/                             # Frontend UI (vanilla, no build step)
 ├── index.html                  # Chat interface
-├── app.js                      # Client logic
+├── app.js                      # Client logic (incl. HITL confirmation card)
 └── styles.css                  # Light theme styling
 
 packaging/                       # Build system
@@ -179,8 +221,17 @@ packaging/                       # Build system
 ├── build.py                    # Build wrapper (optional --fetch-tectonic)
 └── make_icon.py                # Generates reportstudio.ico
 
-tests/                           # Test suite (pytest + anyio)
-├── test_report_pipeline.py
+scripts/                         # Developer utilities
+└── network_diag.py             # Connectivity diagnostics (search backends, LLM endpoints)
+
+tests/                           # Test suite (pytest + anyio, fully offline by default)
+├── test_report_pipeline.py     # Gates, LaTeX escaping, end-to-end happy path
+├── test_search_router.py       # Query classification + backend fallback chains
+├── test_search_cache.py        # Disk cache TTL / corruption / atomicity
+├── test_credibility.py         # L1-L4 grading + weighted ranking
+├── test_alignment.py           # Aligned strategy: clustering, tri-classification, 孤证 review
+├── test_comparison_report.py   # Comparison matrix + synthesis sections
+├── test_hitl.py                # ConfirmationGate + confirm endpoint
 ├── test_report_session_wiring.py
 ├── test_database_mode.py
 ├── test_database_store.py
@@ -210,49 +261,104 @@ Intent Classifier
         → Full pipeline (30-120s, $0.15-0.30)
 ```
 
+## 🔎 Search Router
+
+When `CE_SEARCH_ROUTER_ENABLED=true` (default) and no provider was explicitly injected, `gather_sources` routes each query through `report/router.py`:
+
+**Classification** — rules short-circuit first (cheap, deterministic); when no rule fires an LLM classifier breaks the tie, and any failure degrades to `general`:
+
+| QueryType | Triggered by | Backend chain |
+|-----------|--------------|---------------|
+| `fact` | `site:.gov` / `site:.edu` / official-source markers | configured provider → tavily → duckduckgo |
+| `deep_research` | "对比", "深度", "in-depth", "analysis", … | configured provider → tavily → duckduckgo |
+| `chinese` | >30 % CJK characters in the query | **jina** → tavily → duckduckgo |
+| `structured` | "表格", "营收", "市场规模", "table", "revenue", … | **firecrawl** → tavily → duckduckgo |
+| `academic` | "paper", "study", "arxiv", "论文", … | configured provider → tavily → duckduckgo |
+| `general` | fallback when nothing matched | configured provider → tavily → duckduckgo |
+
+**Fallback semantics** — a backend that can't be constructed (missing API key) is skipped; a backend raising `SearchUnavailableError` (auth failure, blocked, timeout after retries) falls through to the next chain entry. If every entry fails, `SearchUnavailableError` is raised naming all attempts. The registry records which backend actually served each query (`routes` diagnostics).
+
+**Caching** — `search_cache.py` stores hit lists as JSON files under `user_data_dir()/search_cache/`, keyed by `sha256(backend + query)[:16]`, TTL `CE_SEARCH_CACHE_TTL_S` (default 24 h, `0` disables). Writes are atomic (tmp file + `os.replace`); corrupt or expired entries read as a miss. Cache failures never break a search.
+
+**Backends** — instantiated by name via `scrape.get_search_provider(name)`:
+
+| Name | Key | Notes |
+|------|-----|-------|
+| `duckduckgo` | none | Keyless, zero-setup default |
+| `tavily` | `CE_SEARCH_API_KEY` | Higher-quality search API |
+| `firecrawl` | `CE_FIRECRAWL_API_KEY` | Extraction-oriented; preferred for `structured` queries |
+| `jina` | `CE_JINA_API_KEY` (optional) | Works keyless with tighter rate limits; preferred for `chinese` queries |
+| `fake` | none | Deterministic offline fixtures (tests) |
+
+Set `CE_SEARCH_ROUTER_ENABLED=false` to pin the legacy single-provider behavior.
+
 ## 🔧 Configuration Options
 
 ### Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `CE_VERIFY_MODE` | `traceable` | Verification strategy (`traceable` or `strict`) |
-| `CE_VERIFY_ROUNDS` | `3` | Triple-check rounds per claim |
-| `CE_MIN_SOURCES_PER_CLAIM` | `2` | Distinct authoritative domains per claim |
-| `CE_MIN_AUTHORITATIVE_SOURCES` | `3` | Minimum total authoritative sources |
-| `CE_MIN_VERIFIED_CLAIMS` | `5` | Threshold for out-of-scope fallback |
+| `CE_VERIFY_STRATEGY` | `aligned` | Verification strategy (`aligned`, `conflict_only`, `cross_reference`) |
+| `CE_VERIFY_MODE` | `traceable` | Verification mode (`traceable` or `strict`) |
+| `CE_VERIFY_ROUNDS` | `3` | Triple-check rounds per claim (legacy) |
+| `CE_MIN_SOURCES_PER_CLAIM` | `1` | Distinct authoritative domains per claim |
+| `CE_MIN_AUTHORITATIVE_SOURCES` | `2` | Minimum total authoritative sources |
+| `CE_MIN_VERIFIED_CLAIMS` | `3` | Threshold for out-of-scope fallback |
+| `CE_SEARCH_ROUTER_ENABLED` | `true` | Route queries through the Search Router |
+| `CE_SEARCH_CACHE_TTL_S` | `86400` | On-disk search cache TTL (`0` disables) |
+| `CE_FIRECRAWL_API_KEY` | — | Firecrawl backend key |
+| `CE_JINA_API_KEY` | — | Jina Reader key (optional; keyless works) |
+| `CE_SCRAPE_ROBOTS_FAIL_OPEN` | `true` | When robots.txt can't be fetched: allow (true) or skip (false) the page |
+| `CE_RANK_W_RELEVANCE` | `0.5` | Source ranking weight: relevance |
+| `CE_RANK_W_SOURCE` | `0.35` | Source ranking weight: credibility (L1-L4) |
+| `CE_RANK_W_FRESHNESS` | `0.15` | Source ranking weight: freshness |
+| `CE_ALIGNMENT_DEVIATION_THRESHOLD` | `0.6` | Baseline-deviation score that downgrades an isolated claim |
+| `CE_ACTIVE_VERIFY_ENABLED` | `true` | One bounded active-verification round for core isolated claims |
+| `CE_ACTIVE_VERIFY_MAX_QUERIES` | `3` | Max proxy-metric re-search queries per run |
+| `CE_HITL_ON_ISOLATED_CORE_CLAIM` | `false` | Pause for human confirmation on core isolated claims |
+| `CE_ENABLE_SYNTHESIS_SECTIONS` | `true` | Append source_comparison + limitations sections |
+| `CE_REPORT_LOCALE` | `en` | Report language (`en` or `zh`; `zh` uses ctex) |
 | `CE_LLM_TIMEOUT_S` | `120` | Per-LLM call timeout |
+| `CE_LLM_MAX_CONCURRENCY` | `4` | Global cap on concurrent LLM requests |
 | `CE_VERIFY_DEADLINE_S` | `360` | Verification stage deadline |
 | `CE_ASSEMBLE_DEADLINE_S` | `300` | Assembly stage deadline |
-| `CE_LATEX_ENGINE` | `xelatex` | LaTeX compiler engine |
+| `CE_LATEX_ENGINE` | `auto` | LaTeX compiler engine (`auto`/`tectonic`/`xelatex`/`pdflatex`/`latexmk`) |
 | `CE_MULTI_QUERY_RESEARCH` | `true` | Section-targeted searches |
-| `CE_MAX_DEEP_DIVES` | `5` | Maximum analytical deep-dive sections |
+| `CE_MAX_DEEP_DIVES` | `8` | Maximum analytical deep-dive sections |
+| `CE_APP_PORT` | random | Fixed port for the local backend (debugging) |
+| `CE_APP_SESSION_TOKEN` | per-launch | Loopback session token (set by the shell; not a user setting) |
 
 ### Verification Strategies
 
-**`traceable` (Recommended Default):**
-- Claims must be fully supported by authoritative sources
-- Cross-domain corroboration required
-- Paraphrase and synthesis allowed (not verbatim quotes)
-- Faster processing, suitable for most use cases
-
-**`strict` (Maximum Rigor):**
-- Every claim requires verbatim spans from sources
-- No paraphrase allowed
-- Slower but highest verification standard
+**`aligned` (Default):**
+- Accepts all claims up-front (like `conflict_only`), then adds an alignment/fusion layer
+- Structured claims (entity/attribute/value/qualifier/time_scope slots, extracted when possible) are alias-normalized and clustered by (entity, attribute)
+- Intra-cluster pairs are tri-classified: **corroborate** / **complement** / **conflict** (conflicts drop the lower-authority claim)
+- Single-source L3/L4 claims are marked isolated and get the [isolated-claim review](#isolated-claim-孤证-handling)
+- Cluster data feeds the source-comparison matrix in the report
 
 **`conflict_only` (Fast Mode):**
 - Accept claims by default
-- Only detect and resolve contradictions
+- Only detect and resolve contradictions (lexical prefilter + contradiction oracle)
 - 50-100x faster than cross-reference verification
 - Best for trusted source bases
+
+**`cross_reference` (Legacy Strict):**
+- Every claim is traced/entailed against its own sources and the whole pool, then tiered
+- Stricter and slower; kept for backwards compatibility
+
+**Verification modes** (orthogonal to strategy):
+- **`traceable`** (default) — Claims must be judged fully supported by an authoritative source; paraphrase and synthesis allowed
+- **`strict`** — Every claim requires verbatim spans from sources; no paraphrase allowed
 
 ## 📊 Report Output
 
 ### Generated Files
 
-- **`output/<topic>_report.pdf`** — Final typeset report
-- **`output/<topic>_report.tex`** — LaTeX source (for manual editing)
+- **`output/<slug>-<hash8>.pdf`** — Final typeset report
+- **`output/<slug>-<hash8>.tex`** — LaTeX source (for manual editing)
+
+`slug` is derived from the topic and `hash8` is a short SHA-1 prefix of the raw topic, so two topics whose slugs collide (punctuation/casing differences, truncation) never overwrite each other.
 
 ### Report Sections
 
@@ -261,13 +367,15 @@ Intent Classifier
 3. **Industry Chain Map** — TikZ visualization of supply relationships
 4. **Market Size** — Historical data charts + TAM/SAM/SOM analysis
 5. **Competitive Landscape** — Market share tables and visualizations
+6. **Source Comparison & Divergence** — Comparison matrix + divergence analysis (when alignment clusters exist)
+7. **Information Limitations** — Deterministic statement of what the sources could not establish
 
 ### LaTeX Features
 
 - **TikZ flow diagrams** — Industry chain visualization
 - **pgfplots charts** — Market size time series
-- **booktabs tables** — Professional competitive analysis
-- **XeLaTeX compilation** — Unicode support for international text
+- **booktabs tables** — Professional competitive analysis + source comparison matrix
+- **XeLaTeX compilation** — Unicode support for international text (`ctex` when `CE_REPORT_LOCALE=zh`)
 - **Automatic escaping** — Safe rendering of untrusted source text
 
 ## 🛠️ Build History & Fixes
@@ -307,8 +415,17 @@ Intent Classifier
 
 #### Verification Optimization (v0.10)
 - **Update:** Doubled all timeout values (120s/360s/300s)
-- **Strategy:** Default to `conflict_only` for faster processing
+- **Strategy:** Adopted `conflict_only` for faster processing (superseded in 0.2.0 — the default is now `aligned`)
 - **Result:** 2x time budget, adaptive pair generation, fast-fail logic
+
+#### Research-Quality Overhaul (v0.2.0)
+- **Search Router** — Query-type classification + per-type backend fallback chains + disk cache
+- **New backends** — Firecrawl and Jina join DuckDuckGo/Tavily
+- **Credibility grading** — L1-L4 source levels drive ranking and conflict resolution
+- **Aligned verification** — Entity clustering, isolated-claim (孤证) review, active re-verification
+- **Synthesis layer** — Source-comparison matrix, limitations section, zh locale
+- **HITL** — Optional human confirmation gate on core isolated claims
+- **Hardening** — Loopback session token, atomic history writes, collision-proof output filenames, CI workflow
 
 ### Known Issues (Resolved)
 
@@ -323,6 +440,8 @@ Intent Classifier
 | Settings not persisting | ✅ Fixed | Error handling + field retention |
 | LLM client import error | ✅ Fixed | Correct module path |
 | Intent classification failure | ✅ Fixed | Proper LLM interface |
+| Concurrent report overwrites | ✅ Fixed | Topic-hash filename suffix |
+| Local API open to other processes | ✅ Fixed | Loopback session token middleware |
 
 ## 🧪 Testing
 
@@ -365,6 +484,12 @@ Get-Content $env:LOCALAPPDATA\reportstudio\sessions\app.log -Tail 50
 tail -f "$LOCALAPPDATA/reportstudio/sessions/app.log"
 ```
 
+**Network diagnostics** (connectivity to search backends / LLM endpoints):
+
+```bash
+python scripts/network_diag.py
+```
+
 ## 📈 Performance & Cost
 
 ### Chat Mode
@@ -379,7 +504,8 @@ tail -f "$LOCALAPPDATA/reportstudio/sessions/app.log"
 
 ### Verification Strategies
 - **cross_reference:** 3-5 minutes for 50 claims (strict)
-- **conflict_only:** ~30 seconds for 50 claims (fast, default)
+- **conflict_only:** ~30 seconds for 50 claims (fast)
+- **aligned:** ~1 minute for 50 claims (default; adds clustering + isolated-claim review on top of conflict_only)
 - **traceable:** 1-2 minutes for 50 claims (balanced)
 
 ## 🔒 Security Notes
@@ -396,9 +522,15 @@ tail -f "$LOCALAPPDATA/reportstudio/sessions/app.log"
 - Never logged or transmitted to unauthorized endpoints
 - Password fields cleared after save in UI
 
+### Local API
+- The desktop shell generates a random **session token** per launch (`CE_APP_SESSION_TOKEN`)
+- When set, every `/api/*` request must present it (`?token=` or `X-Session-Token` header); `/api/health` is exempt so the shell can probe readiness
+- Static assets are exempt (`<script>`/`<link>` tags can't carry tokens); the protected surface is the state-mutating API
+- When unset (CLI runs, tests) all requests pass — preserving the no-auth desktop default
+
 ### Source Filtering
 - Strict allowlist prevents malicious content sources
-- robots.txt compliance for ethical scraping
+- robots.txt compliance for ethical scraping (`CE_SCRAPE_ROBOTS_FAIL_OPEN` controls behavior when robots.txt itself can't be fetched)
 - User-Agent identification for transparency
 
 ## 🎓 Advanced Usage
@@ -446,9 +578,12 @@ pip install -e ".[app,dev]"
 pytest tests/
 
 # Run linting
-black src/
+ruff format src/
+ruff check src/
 mypy src/
 ```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the full guide (ground rules, test conventions, style).
 
 ### Project Goals
 
@@ -501,7 +636,7 @@ For issues and questions:
 
 ---
 
-**Version:** v0.10  
+**Version:** 0.2.0  
 **Build:** ReportStudio.exe (134 MB)  
 **Last Updated:** 2026-07-17  
 **Status:** Production Ready ✅
