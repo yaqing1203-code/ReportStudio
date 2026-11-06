@@ -117,7 +117,8 @@ async def test_spacing_is_shared_across_parallel_model_requests(monkeypatch):
     llm = OpenAILLM("test-key", "example-model", 4096, "https://compatible.example/v1")
     starts = []
     async def transport(*args):
-        starts.append(time.monotonic())
+        # Use a high-resolution clock on Windows Python 3.11.
+        starts.append(time.perf_counter())
         return "[]"
     monkeypatch.setattr(llm, "_transport", transport)
     assert await asyncio.gather(*(llm.complete("s", "u") for _ in range(3))) == ["[]"] * 3
