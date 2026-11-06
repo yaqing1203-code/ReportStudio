@@ -18,12 +18,14 @@ from __future__ import annotations
 
 import csv
 import io
+import zipfile
+from itertools import islice
 from pathlib import Path
 
 # Formats we accept. Legacy binary .doc is intentionally NOT here — there is no
 # reliable pure-Python parser bundled; we ask the user to convert to .docx.
 SUPPORTED_EXTENSIONS = frozenset({
-    ".pdf", ".docx", ".xlsx", ".xls", ".csv", ".txt", ".md", ".markdown", ".text",
+    ".pdf", ".docx", ".xlsx", ".csv", ".txt", ".md", ".markdown", ".text",
 })
 
 # Hard ceiling on an uploaded file (bytes). Guards against a pathological upload
@@ -33,6 +35,11 @@ MAX_FILE_BYTES = 25 * 1024 * 1024
 # Cap on extracted text length (characters). The LLM only reads the first
 # llm_context_chars anyway; this bounds storage + keeps the DB session small.
 MAX_TEXT_CHARS = 200_000
+MAX_ARCHIVE_BYTES = 100 * 1024 * 1024
+MAX_ARCHIVE_ENTRIES = 2000
+MAX_PDF_PAGES = 500
+MAX_SHEET_ROWS = 20_000
+MAX_SHEET_COLUMNS = 256
 
 
 class DocumentError(Exception):
@@ -43,7 +50,7 @@ def _clean(text: str) -> str:
     """Normalize whitespace and drop control chars that confuse downstream stages."""
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     # Strip other C0 control chars except tab/newline.
-    text = "".join(ch for ch in text if ch == "\n" or ch == "\t" or ord(ch) >= 32)
+    text = "".join(ch for ch in text if ch in "\n\t\f" or ord(ch) >= 32)
     # Collapse runs of blank lines.
     lines = [ln.rstrip() for ln in text.split("\n")]
     out: list[str] = []
@@ -74,6 +81,8 @@ def parse_document(filename: str, raw: bytes) -> tuple[str, str]:
 
     ext = Path(filename).suffix.lower()
     title = Path(filename).stem.strip() or "Untitled document"
+    if ext in {".docx", ".xlsx"}:
+        _check_archive(raw)
 
     if ext == ".pdf":
         text = _parse_pdf(raw)
@@ -105,6 +114,32 @@ def parse_document(filename: str, raw: bytes) -> tuple[str, str]:
     return title, text
 
 
+def _check_archive(raw: bytes) -> None:
+    """Office formats are ZIP containers; cap expansion before loading their XML."""
+    try:
+        with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+            entries = archive.infolist()
+            if (len(entries) > MAX_ARCHIVE_ENTRIES
+                    or sum(entry.file_size for entry in entries) > MAX_ARCHIVE_BYTES):
+                raise DocumentError("Document archive expands beyond the safe parsing limit.")
+    except (zipfile.BadZipFile, OSError) as exc:
+        raise DocumentError("The document is not a valid Office archive.") from exc
+
+
+def _join_bounded(parts, separator: str = "\n") -> str:
+    result = []
+    used = 0
+    for part in parts:
+        remaining = MAX_TEXT_CHARS - used
+        if remaining <= 0:
+            break
+        result.append(part[:remaining])
+        used += len(result[-1]) + 1
+        if used >= MAX_TEXT_CHARS:
+            break
+    return separator.join(result)[:MAX_TEXT_CHARS]
+
+
 # --------------------------------------------------------------------------
 # Per-format parsers. Each imports its dependency lazily and raises DocumentError
 # (never a bare ImportError) so the failure is actionable.
@@ -117,10 +152,13 @@ def _parse_pdf(raw: bytes) -> str:
         from pypdf import PdfReader
 
         reader = PdfReader(io.BytesIO(raw))
-        parts = [(page.extract_text() or "") for page in reader.pages]
-        text = "\n".join(parts).strip()
+        if len(reader.pages) > MAX_PDF_PAGES:
+            raise DocumentError("PDF exceeds the 500-page parsing limit.")
+        text = _join_bounded((page.extract_text() or "" for page in reader.pages), "\f").strip()
         if text:
             return text
+    except DocumentError:
+        raise
     except Exception:
         text = ""
 
@@ -129,10 +167,13 @@ def _parse_pdf(raw: bytes) -> str:
         import fitz  # PyMuPDF
 
         with fitz.open(stream=raw, filetype="pdf") as doc:
-            parts = [page.get_text() for page in doc]
-        text = "\n".join(parts).strip()
+            if len(doc) > MAX_PDF_PAGES:
+                raise DocumentError("PDF exceeds the 500-page parsing limit.")
+            text = _join_bounded((page.get_text() for page in doc), "\f").strip()
         if text:
             return text
+    except DocumentError:
+        raise
     except Exception:
         pass
 
@@ -157,14 +198,16 @@ def _parse_docx(raw: bytes) -> str:
     except Exception as e:
         raise DocumentError(f"Could not open the .docx file: {e}")
 
-    parts: list[str] = [p.text for p in document.paragraphs if p.text and p.text.strip()]
-    # Include table cell text — data tables are common in the documents users add.
-    for table in getattr(document, "tables", []):
-        for row in table.rows:
-            cells = [c.text.strip() for c in row.cells if c.text and c.text.strip()]
-            if cells:
-                parts.append(" | ".join(cells))
-    return "\n".join(parts)
+    def parts():
+        for paragraph in document.paragraphs:
+            if paragraph.text.strip():
+                yield paragraph.text
+        for table in document.tables:
+            for row in table.rows:
+                cells = [c.text.strip() for c in row.cells if c.text.strip()]
+                if cells:
+                    yield " | ".join(cells)
+    return _join_bounded(parts())
 
 
 def _parse_xlsx(raw: bytes, ext: str) -> str:
@@ -185,29 +228,29 @@ def _parse_xlsx(raw: bytes, ext: str) -> str:
     except Exception as e:
         raise DocumentError(f"Could not open the spreadsheet: {e}")
 
-    parts: list[str] = []
-    for ws in wb.worksheets:
-        parts.append(f"# Sheet: {ws.title}")
-        for row in ws.iter_rows(values_only=True):
-            cells = [str(c) for c in row if c is not None and str(c).strip()]
-            if cells:
-                parts.append(" | ".join(cells))
+    def rows():
+        for ws in wb.worksheets:
+            yield f"# Sheet: {ws.title}"
+            # Ignore untrusted declared dimensions and stop at actual XML row data.
+            ws.reset_dimensions()
+            for row in islice(ws.iter_rows(max_col=MAX_SHEET_COLUMNS, values_only=True),
+                              MAX_SHEET_ROWS):
+                cells = [str(c) for c in row if c is not None and str(c).strip()]
+                if cells:
+                    yield " | ".join(cells)
     try:
+        return _join_bounded(rows())
+    finally:
         wb.close()
-    except Exception:
-        pass
-    return "\n".join(parts)
 
 
 def _parse_csv(raw: bytes) -> str:
     text = _decode(raw)
-    parts: list[str] = []
     reader = csv.reader(io.StringIO(text))
-    for row in reader:
-        cells = [c.strip() for c in row if c and c.strip()]
-        if cells:
-            parts.append(" | ".join(cells))
-    return "\n".join(parts)
+    try:
+        return _join_bounded(" | ".join(c.strip() for c in row if c.strip()) for row in reader)
+    except csv.Error as exc:
+        raise DocumentError(f"Could not parse CSV: {exc}") from exc
 
 
 def _parse_text(raw: bytes) -> str:

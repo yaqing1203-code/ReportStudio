@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any
 
 from core_engine.app import runtime
+from core_engine.security.files import atomic_write_text, storage_path
 
 
 def _now_iso() -> str:
@@ -40,13 +41,11 @@ def _db_root() -> Path:
 
 
 def _session_dir(session_id: str) -> Path:
-    d = _db_root() / session_id
-    d.mkdir(parents=True, exist_ok=True)
-    return d
+    return storage_path(_db_root(), session_id)
 
 
 def _session_path(session_id: str) -> Path:
-    return _session_dir(session_id) / "session.json"
+    return storage_path(_session_dir(session_id), "session", ".json")
 
 
 # --------------------------------------------------------------------------
@@ -60,16 +59,25 @@ def _source_to_dict(src: Any) -> dict:
         "kind": src.kind.value,
         "text": src.text,
         "fetched_at": src.fetched_at,
+        "credibility": int(src.credibility),
+        "published_at": src.published_at,
+        "document_format": src.document_format,
+        "metadata": src.metadata,
     }
 
 
 def _dict_to_source(d: dict) -> Any:
-    from core_engine.report.models import Source, SourceKind
+    from core_engine.report.models import CredibilityLevel, Source, SourceKind
+    from core_engine.report.sources import credibility_for
 
     try:
         kind = SourceKind(d.get("kind", "general_web"))
     except ValueError:
         kind = SourceKind.GENERAL_WEB
+    try:
+        credibility = CredibilityLevel(d["credibility"]) if "credibility" in d else credibility_for(d["url"])
+    except (ValueError, TypeError):
+        credibility = CredibilityLevel.L3
     return Source(
         url=d["url"],
         domain=d.get("domain", ""),
@@ -77,18 +85,25 @@ def _dict_to_source(d: dict) -> Any:
         kind=kind,
         text=d.get("text", ""),
         fetched_at=d.get("fetched_at", _now_iso()),
+        credibility=credibility,
+        published_at=d.get("published_at"),
+        document_format=d.get("document_format", ""),
+        metadata=d.get("metadata", {}) if isinstance(d.get("metadata", {}), dict) else {},
     )
 
 
 # --------------------------------------------------------------------------
 # Session CRUD.
 # --------------------------------------------------------------------------
-def create_session(topic: str) -> str:
+def create_session(topic: str, *, depth: str = "standard") -> str:
     """Create a new database session for a topic. Returns the session id."""
+    if depth not in {"standard", "deep"}:
+        raise ValueError("Invalid generation depth")
     session_id = uuid.uuid4().hex
-    data = {
+    data: dict[str, Any] = {
         "id": session_id,
         "topic": topic,
+        "depth": depth,
         "created": _now_iso(),
         "brief_job_id": None,
         "brief_status": "pending",     # pending | completed | out_of_scope | error
@@ -101,14 +116,32 @@ def create_session(topic: str) -> str:
     return session_id
 
 
+def set_depth(session_id: str, depth: str) -> None:
+    if depth not in {"standard", "deep"}:
+        raise ValueError("Invalid generation depth")
+    data = _require(session_id)
+    data["depth"] = depth
+    _write(session_id, data)
+
+
+def set_output_template(session_id: str, template_id: str | None, fields: dict) -> None:
+    data = get_session(session_id)
+    if data is not None:
+        data.update(template_id=template_id, template_fields=fields)
+        atomic_write_text(_session_path(session_id), json.dumps(data, ensure_ascii=False, indent=2))
+
+
 def _write(session_id: str, data: dict) -> None:
-    _session_path(session_id).write_text(
-        json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8"
-    )
+    path = _session_path(session_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_text(path, json.dumps(data, indent=2, ensure_ascii=False))
 
 
 def get_session(session_id: str) -> dict | None:
-    p = _session_path(session_id)
+    try:
+        p = _session_path(session_id)
+    except ValueError:
+        return None
     if not p.exists():
         return None
     try:
@@ -221,6 +254,7 @@ def sources_for_comprehensive(session_id: str) -> list[Any]:
             kind=SourceKind.USER_PROVIDED,
             text=art.get("text", ""),
             fetched_at=art.get("added", _now_iso()),
+            document_format=Path(art.get("filename", "")).suffix.lower().lstrip("."),
         ))
     return sources
 

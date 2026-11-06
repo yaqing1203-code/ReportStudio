@@ -88,11 +88,12 @@ def add_entry(
     job_id: str | None = None,
     session_id: str | None = None,
     pdf_ready: bool = False,
+    depth: str | None = None,
 ) -> str:
     """Append a new history entry (newest first). Returns its id."""
     items = _load()
     entry_id = f"h{_now_ms()}_{uuid.uuid4().hex[:5]}"
-    items.insert(0, {
+    entry = {
         "id": entry_id,
         "kind": kind,
         "title": title,
@@ -101,7 +102,10 @@ def add_entry(
         "job_id": job_id,
         "session_id": session_id,
         "pdf_ready": pdf_ready,
-    })
+    }
+    if depth is not None:
+        entry["depth"] = depth
+    items.insert(0, entry)
     _save(items)
     return entry_id
 

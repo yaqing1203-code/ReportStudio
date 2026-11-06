@@ -21,12 +21,25 @@ import json
 import logging
 import random
 import re
-from dataclasses import dataclass
+import time
+from contextvars import ContextVar
+from dataclasses import dataclass, field
 from typing import Protocol
 
 from core_engine.config import get_settings
+from core_engine.report.text import (
+    content_terms,
+    lexical_tokens,
+    numbers_supported,
+    numeric_tokens,
+    split_sentences,
+)
 
 log = logging.getLogger(__name__)
+
+# A bounded per-call override. Context-local so concurrent reports keep their own
+# configured budget even while a composition retries a truncated review.
+_completion_budget: ContextVar[int | None] = ContextVar("completion_budget", default=None)
 
 
 class LLMRateLimitError(Exception):
@@ -39,6 +52,25 @@ class LLMRateLimitError(Exception):
     def __init__(self, message: str, status: int | None = None) -> None:
         super().__init__(message)
         self.status = status
+
+
+class LLMResponseError(ValueError):
+    """An incomplete model response is not evidence that a document has no facts."""
+
+    def __init__(self, reason: str):
+        self.reason = reason
+        super().__init__(f"Model response unavailable ({reason}); check output budget and thinking mode")
+
+
+def completion_text(raw: object, finish_reason: str | None = None) -> str:
+    if finish_reason in {"length", "max_tokens", "model_context_window_exceeded"}:
+        raise LLMResponseError("output_limit")
+    if finish_reason in {"content_filter", "refusal"}:
+        raise LLMResponseError("provider_refusal")
+    text = strip_think_tags(raw) if isinstance(raw, str) else ""
+    if not text.strip():
+        raise LLMResponseError("empty_final_answer")
+    return text
 
 
 def _status_of(exc: Exception) -> int | None:
@@ -95,6 +127,9 @@ class ExtractedClaim:
     value: str | None = None
     qualifier: str | None = None
     time_scope: str | None = None
+    metric: dict | None = None
+    source_windows: dict[str, list[list[int]]] = field(default_factory=dict)
+    source_quote: str | None = None
 
 
 @dataclass(slots=True)
@@ -251,6 +286,14 @@ class FakeLLM:
             if marker in system:
                 return response
         sys_l = system.lower()
+        if "research planner" in sys_l:
+            return '{"questions":[]}'
+        if "research coverage assessor" in sys_l:
+            return '{"assessments":[]}'
+        if "evidence-based analyst" in sys_l:
+            return '{"findings":[]}'  # Extractive baseline never pretends to reason.
+        if "analysis critic" in sys_l:
+            return '{"acceptable":false,"unsupported_assertions":["No semantic reviewer in offline baseline"]}'
         if "intent classifier" in sys_l or "report_generation" in sys_l:
             u = user.lower()
             report_kw = ("report", "analyze", "analysis", "research", "market",
@@ -277,7 +320,7 @@ class FakeLLM:
         if "deviation assessor" in sys_l:
             return json.dumps({"deviation": 0.0, "note": "[fake] within baseline"})
         if "source note writer" in sys_l:
-            return "[fake] single-source note: provenance recorded, timeliness assumed."
+            return "[fake] single-source note: provenance recorded; publication recency is not inferred from fetch time."
         if "verification query generator" in sys_l:
             return "[]"
         # Plain chat fallback.
@@ -301,6 +344,7 @@ class FakeLLM:
                         value=_slot(it.get("value")),
                         qualifier=_slot(it.get("qualifier")),
                         time_scope=_slot(it.get("time_scope")),
+                        metric=it.get("metric") if isinstance(it.get("metric"), dict) else None,
                     ))
             return out
         sentences = _split_sentences(text)
@@ -318,7 +362,7 @@ class FakeLLM:
         # Strict: the claim is supported only if a near-verbatim span exists in the
         # source. We find the best-overlap sentence and require high token overlap.
         best, score = _best_overlap(claim, source_text)
-        if score >= 0.85 and best:
+        if score >= 0.85 and best and numbers_supported(claim, best):
             return EntailmentJudgement(supports=True, quote=best, note=f"overlap={score:.2f}")
         return EntailmentJudgement(supports=False, quote="", note=f"overlap={score:.2f}")
 
@@ -370,6 +414,14 @@ class FakeLLM:
         # real-LLM-only prompt refinement; the fake stays purely deterministic.
         if not claims:
             return ""
+        if all(re.match(r"^\[\[[A-Za-z0-9_, -]+\]\]", claim) for claim in claims):
+            sentences = []
+            for i, claim in enumerate(claims):
+                marker = re.match(r"^\[\[([A-Za-z0-9_, -]+)\]\]\s*(.*)$", claim, re.DOTALL)
+                for text in split_sentences(marker[2]):
+                    sentences.append({"text": text, "claim_ids": marker[1].split(","),
+                                      "paragraph_index": i // 2})
+            return json.dumps({"sentences": sentences}, ensure_ascii=False)
         paras = []
         for i in range(0, len(claims), 2):
             chunk = claims[i : i + 2]
@@ -406,23 +458,25 @@ class FakeLLM:
                 m = re.search(rf"\b{key}\b\D*([\d.]+)\s*([A-Za-z$ ]*bn|[A-Za-z$ ]*billion)?",
                               text, re.IGNORECASE)
                 if m:
-                    market[key] = float(m.group(1))
+                    market[key] = m.group(1)
+                    if m.group(2):
+                        market["unit"] = m.group(2).strip()
                     market.setdefault("claim_ids", []).append(cid)
             m = re.search(r"\bcagr\b\D*([\d.]+)\s*%", text, re.IGNORECASE)
             if m:
-                market["cagr_pct"] = float(m.group(1))
+                market["cagr_pct"] = m.group(1)
                 market.setdefault("claim_ids", []).append(cid)
             m = re.search(r"\b(19|20)\d{2}\b.*?([\d.]+)\s*(USD\s*bn|billion|bn)", text, re.IGNORECASE)
             if m:
                 year = int(re.search(r"\b((?:19|20)\d{2})\b", text).group(1))
-                market["series"].append({"year": year, "value": float(m.group(2)),
+                market["series"].append({"year": year, "value": m.group(2), "unit": m.group(3),
                                          "claim_ids": [cid]})
             m = re.search(r"competitor\s*[:\-]\s*([A-Za-z0-9 &/.]+?)\s+share\s+([\d.]+)\s*%"
                           r"(?:\s+advantage\s+(.+))?", text, re.IGNORECASE)
             if m:
                 competitors.append({
                     "name": m.group(1).strip(),
-                    "market_share_pct": float(m.group(2)),
+                    "market_share_pct": m.group(2),
                     "advantage": (m.group(3) or "").strip(),
                     "claim_ids": [cid],
                 })
@@ -485,6 +539,8 @@ class FakeLLM:
         # finding from the claims; paragraph 2 draws implications by connecting them.
         if not claims:
             return []
+        if all(claim.startswith("[[") for claim in claims):
+            return [await self.draft_section(title, claims)]
         facts = " ".join(c.rstrip(".") + "." for c in claims)
         p1 = f"{title}: {facts}"
         p2 = ("Taken together, these verified data points indicate a material factor "
@@ -509,6 +565,20 @@ class AnthropicLLM:
         self._model = model
         self._max_tokens = max_tokens
         self._sem: asyncio.Semaphore | None = None
+        self._pace_lock: asyncio.Lock | None = None
+        self._next_request_at = 0.0
+
+    async def _pace(self) -> None:
+        interval = get_settings().llm_min_interval_s
+        if interval <= 0:
+            return
+        if self._pace_lock is None:
+            self._pace_lock = asyncio.Lock()
+        async with self._pace_lock:
+            delay = self._next_request_at - time.monotonic()
+            if delay > 0:
+                await asyncio.sleep(delay)
+            self._next_request_at = time.monotonic() + interval
 
     def _gate(self) -> asyncio.Semaphore:
         if self._sem is None:
@@ -530,13 +600,13 @@ class AnthropicLLM:
         client = self._client()
         msg = await client.messages.create(
             model=self._model,
-            max_tokens=self._max_tokens,
+            max_tokens=_completion_budget.get() or self._max_tokens,
             system=system,
             messages=[{"role": "user", "content": user}],
         )
         raw = "".join(block.text for block in msg.content if block.type == "text")
         # Strip model reasoning tags at the boundary so nothing downstream sees them.
-        return strip_think_tags(raw)
+        return completion_text(raw, getattr(msg, "stop_reason", None))
 
     async def _complete(self, system: str, user: str) -> str:
         """Rate-limited, retrying entry point that EVERY report method funnels through.
@@ -555,6 +625,7 @@ class AnthropicLLM:
         async with self._gate():
             for attempt in range(1, attempts + 1):
                 try:
+                    await self._pace()
                     return await self._transport(system, user)
                 except Exception as e:
                     status = _status_of(e)
@@ -586,9 +657,24 @@ class AnthropicLLM:
         chat/intent layer; report methods call _complete directly."""
         return await self._complete(system, user)
 
-    async def extract_claims(self, source_url: str, text: str) -> list[ExtractedClaim]:
+    async def complete_with_budget(self, system: str, user: str, *, max_tokens: int) -> str:
+        token = _completion_budget.set(max_tokens)
+        try:
+            return await self._complete(system, user)
+        finally:
+            _completion_budget.reset(token)
+
+    async def extract_research_claims(self, source_url: str, text: str, questions: list[str], *, max_claims=None) -> list[ExtractedClaim]:
+        return await self.extract_claims(source_url, text, research_questions=questions, max_claims=max_claims)
+
+    async def extract_claims(self, source_url: str, text: str, *, research_questions=None, max_claims=None) -> list[ExtractedClaim]:
         system = (
-            "Extract ATOMIC, checkable factual claims from the text. Each claim must "
+            "Extract ATOMIC, checkable factual claims from the text. "
+            f"Return at most {get_settings().extraction_max_claims_per_source} high-value claims; "
+            "prioritize substantive observations over background and repeated wording. Each claim must "
+            "Keep experimental conditions, chemistry, full-cell versus half-cell scope, and limitations "
+            "with the observation. Include substantive mechanisms and failure modes as well as numbers. "
+            "Never infer results from a bibliography, paper title, author list or cited reference alone. "
             "be a single verifiable statement, self-contained, no opinions. Return a "
             "JSON array only. Each item is an object: {\"text\": <the claim>, "
             "\"entity\": <the subject the claim is about, e.g. a company or market, or "
@@ -597,12 +683,45 @@ class AnthropicLLM:
             "or null>, \"qualifier\": <scope/calibre qualifiers such as \"GAAP\" or "
             "\"domestic only\", or null>, \"time_scope\": <the period the claim refers "
             "to, e.g. \"FY2023\", or null>}. Omit a slot (or set it null) whenever the "
-            "text does not state it."
+            "text does not state it. For numeric observations, also return an optional "
+            '\"metric\": {\"name\":\"revenue|net_profit|market_size|market_share|gdp|growth_rate|cpi|installed_capacity|capacity_addition|tam|sam|som|cagr|ionic_conductivity|electronic_conductivity|conductivity|gravimetric_energy_density|volumetric_energy_density|specific_capacity|areal_capacity|current_density|critical_current_density|cycle_life|capacity_retention|coulombic_efficiency|interfacial_impedance|impedance\",'
+            '\"value\":\"decimal string, never binary float\",\"unit\":\"explicit source unit\",'
+            '\"entity\":str|null,\"period\":str|null,\"geography\":str|null,\"scope\":str|null,'
+            '\"price_basis\":str|null,\"rate_basis\":str|null,\"value_kind\":str|null,'
+            '\"boundary\":str|null,\"conditions\":{\"temperature\":str|null,\"pressure\":str|null,'
+            '\"test_method\":str|null,\"sample_form\":str|null,\"cell_type\":str|null,'
+            '\"mass_basis\":str|null,\"volume_basis\":str|null,\"current_density\":str|null,'
+            '\"c_rate\":str|null,\"cycle_count\":str|null,\"retention_threshold\":str|null}}. '
+            "Every metric field must be supported by the same quoted observation; "
+            "preserve original metadata wording. Missing metadata MUST be null, never guessed. "
+            "Separate multiple metrics into separate atomic claims. Keep full metric context in claim text."
+            "For scientific tables, bind each value to its exact row, specimen, column unit, caption and applicable footnotes. "
+            "Keep electronic and ionic conductivity distinct, and active-material, electrode, half-cell, full-cell and pack boundaries separate. "
+            "Do not turn ranges, error bars, inequalities or approximate numbers into exact scalar measurements. "
+            "Only measured and explicitly specified conditions belong to an observation; missing temperature, pressure, rate, "
+            "loading or cell geometry remains null. A material property cannot establish complete-cell performance."
         )
-        raw = await self._complete(system, text[:get_settings().llm_context_chars])
+        if research_questions:
+            system += (" This is a question-directed full-text reading task. Prioritize passages addressing the supplied "
+                "research questions and their missing evidence over generic advantages, background or bibliometrics. "
+                "Questions are retrieval goals only, NOT evidence. Extract only what SOURCE states. Include concrete "
+                "route distinctions, failure mechanisms, manufacturing constraints and testing comparability when present. "
+                "Preserve experimental conditions and negative findings; do not fill any missing requirement from memory.")
+            system += (" Also return a quote string for each claim: an EXACT verbatim substring of SOURCE, preserving "
+                "line breaks, sufficient to support the observation. Do not translate or normalize the quote. "
+                "The quote will be checked against SOURCE and does not itself establish semantic support.")
+            if max_claims is not None:
+                system += (f" For this focused deficit return at most {max_claims} SHORT atomic claims. "
+                    "Only extract observations directly addressing the missing requirement. Return [] if absent. "
+                    "Split independent facts into separate items; do not combine multiple claims into one sentence.")
+            user = json.dumps({"research_questions": research_questions,
+                               "SOURCE": text[:get_settings().llm_context_chars]}, ensure_ascii=False)
+        else:
+            user = text[:get_settings().llm_context_chars]
+        raw = await self._complete(system, user)
         items = _safe_json_list(raw)
         out: list[ExtractedClaim] = []
-        for it in items:
+        for it in items[:get_settings().extraction_max_claims_per_source]:
             # Back-compat: a bare string item is a claim with no structured slots.
             if isinstance(it, str):
                 out.append(ExtractedClaim(text=it, candidate_source_urls=[source_url]))
@@ -617,6 +736,8 @@ class AnthropicLLM:
                 value=_slot(it.get("value")),
                 qualifier=_slot(it.get("qualifier")),
                 time_scope=_slot(it.get("time_scope")),
+                metric=it.get("metric") if isinstance(it.get("metric"), dict) else None,
+                source_quote=it["quote"] if isinstance(it.get("quote"), str) and it["quote"] and it["quote"] in text else None,
             ))
         return out
 
@@ -634,7 +755,8 @@ class AnthropicLLM:
         quote = str(obj.get("quote", "") or "")
         # Defensive: a claimed 'support' whose quote is NOT actually in the source
         # is downgraded. The model does not get to invent its own evidence.
-        if supports and quote and quote.strip() not in source_text:
+        if supports and (not quote.strip() or quote.strip() not in source_text
+                         or not numbers_supported(claim, quote)):
             supports = False
             quote = ""
         return EntailmentJudgement(supports=supports, quote=quote)
@@ -646,10 +768,9 @@ class AnthropicLLM:
         system = (
             "You are a fact-checker assessing SEMANTIC support, not verbatim matching. "
             "Read the SOURCE and judge the CLAIM's underlying meaning.\n"
-            "- Set supported=true if the source STATES, IMPLIES, or is CONSISTENT WITH "
-            "the claim's core fact — even in different words, and even if it supports "
-            "the gist rather than every minor detail. Circumstantial or contextual "
-            "support counts.\n"
+            "- Set supported=true only if the source supports ALL material details "
+            "of the claim, including number, sign, unit, entity, scope and period. "
+            "Paraphrase is allowed, mere consistency or topic overlap is insufficient.\n"
             "- Set hallucinated=true ONLY if the source DIRECTLY CONTRADICTS the claim "
             "(states the opposite). If the source simply doesn't mention the claim, "
             "that is NOT a contradiction: supported=false, hallucinated=false.\n"
@@ -661,10 +782,12 @@ class AnthropicLLM:
         user = f"CLAIM:\n{claim}\n\nSOURCE:\n{source_text[:get_settings().llm_context_chars]}"
         raw = await self._complete(system, user)
         obj = _safe_json_obj(raw)
+        span = str(obj.get("evidence_span", "") or "").strip()
         return TraceJudgement(
-            supported=bool(obj.get("supported", False)),
+            supported=bool(obj.get("supported", False)) and bool(span)
+                      and span in source_text and numbers_supported(claim, span),
             hallucinated=bool(obj.get("hallucinated", False)),
-            evidence_span=str(obj.get("evidence_span", "") or ""),
+            evidence_span=span,
             confidence=float(obj.get("confidence", 0.0) or 0.0),
         )
 
@@ -715,7 +838,12 @@ class AnthropicLLM:
             "figure, name, or date not present in the claims, MUST NOT speculate, and "
             "MUST NOT pad with filler to reach the length — if the verified material is "
             "limited, write a shorter but accurate section. Separate paragraphs with a "
-            "blank line. Plain text only, no headings or bullet markup.\n"
+            "blank line. Preserve the language requested below.\n"
+            "CITATION CONTRACT: each input claim begins with [[claim_id]]. Return ONLY "
+            'JSON: {"sentences":[{"text":"one complete sentence",'
+            '"claim_ids":["c1"],"paragraph_index":0}]}. '
+            "Cite only supplied claim IDs that support that sentence. Preserve signs, "
+            "units, scope and periods. Do not add facts or source IDs.\n"
             "HEDGING RULES (strict): any claim line marked [UNVERIFIED - single source] "
             "rests on ONE source and has NOT been independently verified. When you draw "
             "on it you MUST hedge explicitly (e.g. \"According to a single source, "
@@ -745,11 +873,13 @@ class AnthropicLLM:
             '{"chain":[{"name":str,"tier":"upstream|midstream|downstream",'
             '"claim_ids":[str]}],'
             '"chain_edges":[{"src":str,"dst":str,"label":str,"claim_ids":[str]}],'
-            '"market":{"tam":num|null,"sam":num|null,"som":num|null,"unit":str,'
-            '"cagr_pct":num|null,"series":[{"year":int,"value":num,"claim_ids":[str]}],'
+            '"market":{"tam":decimal_string|null,"sam":decimal_string|null,"som":decimal_string|null,"unit":str,'
+            '"cagr_pct":decimal_string|null,"series":[{"year":int,"value":decimal_string,"unit":str,"claim_ids":[str]}],'
             '"claim_ids":[str]},'
-            '"competitors":[{"name":str,"market_share_pct":num|null,"advantage":str,'
+            '"competitors":[{"name":str,"market_share_pct":decimal_string|null,"advantage":str,'
             '"claim_ids":[str]}]}'
+            "\nDecimal values must be JSON strings, preserving source precision. Never assume a currency, "
+            "scope or period, or compute growth/share yourself. Omit unsupported values."
         )
         body = "\n".join(f"[{cid}] {text}" for cid, text in verified_claims)
         raw = await self._complete(system, f"TOPIC: {topic}\nCLAIMS:\n{body[:14000]}")
@@ -812,8 +942,10 @@ class AnthropicLLM:
             f"paragraphs (~{s.deep_dive_target_words} words) on the finding. You MAY "
             "interpret, contextualize, and connect the verified facts, and discuss "
             "implications — but you MUST NOT introduce any fact not present in the "
-            "claims, and MUST NOT speculate beyond what they support. Separate "
-            "paragraphs with a blank line. Plain text only."
+            "claims, and MUST NOT speculate beyond what they support. Return ONLY "
+            'JSON: {"sentences":[{"text":"one sentence","claim_ids":["c1"],'
+            '"paragraph_index":0}]}. Claim IDs come from the [[id]] prefixes. '
+            f"Write in {'Chinese' if s.report_locale == 'zh' else 'English'}."
         )
         user = (f"INSIGHT TITLE: {title}\nKIND: {kind}\nVERIFIED CLAIMS:\n"
                 + "\n".join(f"- {c}" for c in claims))
@@ -847,20 +979,36 @@ class OpenAILLM(AnthropicLLM):
         headers = {"Authorization": f"Bearer {self._key}", "Content-Type": "application/json"}
         payload = {
             "model": self._model,
-            "max_tokens": self._max_tokens,
+            "max_tokens": _completion_budget.get() or self._max_tokens,
             "messages": [
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
         }
+        from urllib.parse import urlsplit
+
+        settings = get_settings()
+        minimax = urlsplit(self._base_url).hostname in {"api.minimaxi.com", "api.minimax.cn", "api.minimax.io"}
+        if minimax and self._model.startswith("MiniMax-M3"):
+            payload["max_completion_tokens"] = payload.pop("max_tokens")
+            payload["reasoning_split"] = True
+            if settings.llm_thinking_mode != "provider_default":
+                if settings.llm_thinking_mode == "disabled" and self._model != "MiniMax-M3":
+                    raise LLMResponseError("thinking_disable_unsupported_by_model")
+                payload["thinking"] = {"type": settings.llm_thinking_mode}
         async with httpx.AsyncClient(timeout=get_settings().llm_timeout_s) as client:
             resp = await client.post(url, json=payload, headers=headers)
             resp.raise_for_status()
             data = resp.json()
-        raw = data["choices"][0]["message"]["content"] or ""
+        choices = data.get("choices")
+        if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+            raise LLMResponseError("invalid_completion_envelope")
+        choice = choices[0]
+        message = choice.get("message")
+        raw = message.get("content") if isinstance(message, dict) else None
         # Strip <think>...</think> reasoning tags (DeepSeek-R1, QwQ, etc.) at the
         # boundary — OpenAI-compatible endpoints often front these models.
-        return strip_think_tags(raw)
+        return completion_text(raw, choice.get("finish_reason"))
 
 
 def get_llm() -> LLM:
@@ -884,19 +1032,22 @@ def get_llm() -> LLM:
 # helpers
 # --------------------------------------------------------------------------
 def _split_sentences(text: str) -> list[str]:
-    parts = re.split(r"(?<=[.!?])\s+", text.strip())
-    return [p.strip() for p in parts if len(p.strip()) > 20]
+    return split_sentences(text)
 
 
 def _looks_factual(sentence: str) -> bool:
     if re.search(r"\d", sentence):
+        return True
+    if re.search(r"增长|下降|发布|成立|增加|减少|制造|供应|监管|市场|行业", sentence):
+        return True
+    if re.search(r"\b(?:we|this study|this research|this review|the study)\s+(?:created|report|reports|show|shows|describe|describes|demonstrate|demonstrates)\b", sentence, re.IGNORECASE):
         return True
     return bool(re.search(r"\b(is|are|was|were|reported|announced|found|rose|fell|increased|decreased)\b",
                           sentence, re.IGNORECASE))
 
 
 def _tokens(s: str) -> set[str]:
-    return set(re.findall(r"[a-z0-9]+", s.lower()))
+    return set(lexical_tokens(s))
 
 
 # Discriminating content words for the offline contradiction heuristic — same intent as
@@ -911,18 +1062,13 @@ _FAKE_STOP = frozenset({
 
 
 def _content_terms(text: str) -> set[str]:
-    return {w for w in re.findall(r"[a-z0-9]+", text.lower())
-            if len(w) > 2 and w not in _FAKE_STOP}
+    return content_terms(text, _FAKE_STOP)
 
 
 def _numbers(text: str) -> set[str]:
     """Distinct numeric tokens (integers, decimals, percentages) in a claim, normalized
     so '12' and '12.0' compare equal — the divergence signal the fake conflict check uses."""
-    out: set[str] = set()
-    for m in re.findall(r"\d+(?:\.\d+)?", text):
-        f = float(m)
-        out.add(str(int(f)) if f.is_integer() else str(f))
-    return out
+    return numeric_tokens(text)
 
 
 def _best_overlap(claim: str, source_text: str) -> tuple[str, float]:

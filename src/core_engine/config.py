@@ -5,8 +5,12 @@ Vertical-specific settings live in the adapter layer (ontology.yaml, profiles).
 """
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from functools import lru_cache
 from pathlib import Path
+from typing import Literal
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -73,6 +77,10 @@ class Settings(BaseSettings):
     llm_provider: str = "fake"               # "anthropic" | "openai" | "fake"
     llm_model: str = "claude-opus-4-8"
     llm_max_tokens: int = 4096
+    # MiniMax M3 supports an explicit mode; default preserves provider behaviour.
+    llm_thinking_mode: Literal["provider_default", "adaptive", "disabled"] = "provider_default"
+    extraction_max_claims_per_source: int = Field(default=12, ge=1, le=50)
+    extraction_max_claims: int = Field(default=120, ge=1, le=1000)
     llm_base_url: str = ""                    # CE_LLM_BASE_URL (openai-compatible)
     llm_api_key: str = ""                     # CE_LLM_API_KEY (generic; used by "openai")
     anthropic_api_key: str = ""              # CE_ANTHROPIC_API_KEY
@@ -85,6 +93,7 @@ class Settings(BaseSettings):
     # against tripping the provider's rate limit (429). Keep conservative for shared/free
     # tiers (e.g. MiniMax); raise it for high-quota keys.
     llm_max_concurrency: int = 4
+    llm_min_interval_s: float = Field(default=0.0, ge=0, le=10)
     # 429/5xx are retried with exponential backoff + full jitter, honouring Retry-After.
     # attempts total (incl. the first try); auth/4xx are NOT retried (won't self-heal).
     llm_max_retries: int = 5
@@ -123,6 +132,7 @@ class Settings(BaseSettings):
     # or hanging server can't block the whole gather step.
     scrape_fetch_concurrency: int = 8
     scrape_per_url_timeout_s: float = 25.0   # hard ceiling per URL (robots + page combined)
+    scrape_max_download_bytes: int = Field(default=15 * 1024 * 1024, ge=1024, le=25 * 1024 * 1024)
     scrape_concurrency: int = 6              # max pages fetched in parallel (bounded, polite)
     # Search API calls retry on transient failure with exponential backoff.
     search_max_retries: int = 3
@@ -220,24 +230,25 @@ class Settings(BaseSettings):
     #               synthesized industry-report claims.
     verify_mode: str = "traceable"           # "traceable" | "strict"
     # --- Verification STRATEGY (speed vs. strictness) ---------------------------------
-    #   "aligned" (DEFAULT) — alignment/fusion layer. Like conflict_only it accepts every
-    #       claim up-front, but claims carrying structured slots (entity/attribute/value)
+    #   "aligned" (DEFAULT) — retains candidates without presuming truth. Structured
+    #       claims carrying slots (entity/attribute/value)
     #       are first alias-normalized and clustered by (entity, attribute); inside a
-    #       cluster pairs are classified as corroborate / complement / conflict (conflicts
-    #       drop the lower-authority claim). Single-source L3/L4 claims are marked
+    #       cluster pairs are classified as corroborate / complement / conflict. Both
+    #       sides of conflicts are retained for source binding. Single-source L3/L4 claims are marked
     #       ISOLATED (孤证) and get consistency / deviation / source-note review plus an
     #       optional one-round active-verification re-search. Claims without structured
     #       slots fall back to the lexical conflict path.
-    #   "conflict_only" — fast path (previous default). Accept all claims; spend LLM calls
-    #       ONLY resolving DIRECT CONTRADICTIONS between same-subject claims (lexical
-    #       prefilter + contradiction oracle; lower authority loses).
+    #   "conflict_only" — candidate pair review using a lexical prefilter, without
+    #       treating source rank or absence of contradiction as factual truth.
     #   "cross_reference" — legacy broad-collection model: every claim is traced/entailed
     #       against its own sources and the whole pool, then tiered. Stricter, slower.
+    # All strategies require exact source anchoring before publication. Disputed
+    # claims are displayed separately; unsupported candidates remain leads only.
     verify_strategy: str = "aligned"         # "aligned" | "conflict_only" | "cross_reference"
     # --- Aligned strategy knobs ---
     # Deviation score (0-1, LLM domain-common-sense judgement) above which an ISOLATED
-    # claim is considered an outlier vs. its field's baseline and downgraded one
-    # credibility level.
+    # claim is flagged for external condition/unit/method review. Model memory
+    # alone never changes source credibility or establishes falsehood.
     alignment_deviation_threshold: float = 0.6
     # Active verification for core isolated claims: at most this many proxy-metric
     # queries are generated and re-searched (one round only, no recursion).
@@ -340,6 +351,33 @@ class Settings(BaseSettings):
     # (resolved_sections), the report title, the out-of-scope message, and the
     # LaTeX preamble (ctex for zh).
     report_locale: str = "en"                # "en" | "zh"
+    grounding_deadline_s: float = 180.0      # final sentence -> source audit budget
+    grounding_max_sentences: int = Field(default=500, ge=1, le=5000)
+    # Bounded question-led research. Supplemental queries never run in document-only mode.
+    research_enabled: bool = True
+    research_max_questions: int = Field(default=6, ge=1, le=12)
+    research_max_rounds: int = Field(default=3, ge=0, le=4)
+    research_max_queries: int = Field(default=6, ge=0, le=12)
+    research_deadline_s: float = Field(default=240.0, gt=0, le=600)
+    research_plan_timeout_s: float = Field(default=15.0, gt=0, le=60)
+    research_coverage_timeout_s: float = Field(default=45.0, gt=0, le=120)
+    research_fulltext_enabled: bool = True
+    research_fulltext_max_documents: int = Field(default=6, ge=0, le=12)
+    research_fulltext_locations_per_work: int = Field(default=3, ge=1, le=5)
+    research_fulltext_timeout_s: float = Field(default=60.0, ge=5, le=120)
+    research_local_max_chunks: int = Field(default=6, ge=0, le=12)
+    extraction_max_chunks_per_source: int = Field(default=3, ge=1, le=5)
+    reasoning_enabled: bool = True
+    reasoning_max_findings: int = Field(default=4, ge=1, le=10)
+    reasoning_deadline_s: float = Field(default=45.0, gt=0, le=180)
+    sparse_evidence_enabled: bool = True
+    scholarly_search_enabled: bool = True
+    scholarly_mailto: str = ""              # Optional Crossref polite-pool contact, never included in reports.
+    openalex_search_enabled: bool = True   # Bounded complementary discovery alongside routed searches.
+    openalex_api_key: str = ""             # Optional; sent only to api.openalex.org in a header.
+    openalex_max_results: int = Field(default=6, ge=1, le=8)
+    openalex_timeout_s: float = Field(default=12.0, gt=0, le=60)
+    public_dns_fallback: bool = True        # Re-resolve proxy benchmark mappings through pinned public DoH.
     # Synthesis-layer sections appended after the mandated five: 'source_comparison'
     # (only when alignment clusters exist) and 'limitations' (always, when enabled).
     enable_synthesis_sections: bool = True
@@ -403,16 +441,48 @@ class Settings(BaseSettings):
     # is told never to pad or invent to hit them.
     section_min_paragraphs: int = 2           # ask for multi-paragraph section prose
     section_target_words: int = 260           # target length per section (guidance)
+    # Per-request selection, set on a copied Settings object by the desktop worker.
+    # None preserves the configured engine behavior for existing CLI/API consumers.
+    generation_depth: Literal["standard", "deep"] | None = None
 
     # --- LaTeX ---
     # "auto" resolves through compile.available_engine(): tectonic (bundled/self-
     # contained) first, then a system xelatex/pdflatex/latexmk. Pin a concrete engine
     # to override. The packaged .exe relies on "auto" finding the bundled Tectonic.
-    latex_engine: str = "auto"               # "auto" | "tectonic" | "xelatex" | "pdflatex" | "latexmk"
+    latex_engine: Literal["auto", "tectonic", "xelatex", "pdflatex", "latexmk"] = "auto"
     latex_template_dir: Path = REPO_ROOT / "src" / "core_engine" / "report" / "templates"
     output_dir: Path = REPO_ROOT / "output"
 
 
-@lru_cache
-def get_settings() -> Settings:
+@lru_cache(maxsize=1)
+def _environment_settings() -> Settings:
     return Settings()
+
+
+_RUN_SETTINGS: ContextVar[Settings | None] = ContextVar("report_run_settings", default=None)
+
+
+class _SettingsProvider:
+    """Cached environment settings with task-local overrides for concurrent jobs."""
+
+    def __call__(self) -> Settings:
+        current = _RUN_SETTINGS.get()
+        return current if current is not None else _environment_settings()
+
+    def cache_clear(self) -> None:
+        # Keep the established settings-save/test API; never discard another
+        # running task's immutable profile when the base configuration changes.
+        _environment_settings.cache_clear()
+
+
+get_settings = _SettingsProvider()
+
+
+@contextmanager
+def settings_for_run(settings: Settings) -> Iterator[Settings]:
+    """Pin settings for one async job (and its child tasks), then restore them."""
+    token = _RUN_SETTINGS.set(settings)
+    try:
+        yield settings
+    finally:
+        _RUN_SETTINGS.reset(token)

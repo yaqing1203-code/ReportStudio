@@ -20,6 +20,9 @@ Notes:
     pywebview's platform backend.
   - The heavy dormant KG/RAG deps (psycopg, pgvector, torch, …) are deliberately
     NOT collected — the report app does not import them. Keeps the exe lean.
+  - The public portable build uses pypdf for PDF text extraction. The optional
+    PyMuPDF fallback and native PDF table extraction remain available in source
+    installations with PyMuPDF; its separately licensed runtime is not bundled.
 """
 from pathlib import Path
 
@@ -94,7 +97,6 @@ hiddenimports = (
         "python_multipart",   # canonical name FastAPI imports for multipart uploads
         "multipart",          # legacy shim name FastAPI also imports
         "multipart.multipart",
-        "fitz",               # PyMuPDF PDF fallback
         "docx",               # python-docx (.docx)
         "openpyxl",           # .xlsx spreadsheets
         "core_engine.app.database",
@@ -119,6 +121,7 @@ a = Analysis(
         "psycopg", "psycopg_pool", "pgvector", "sqlalchemy",
         "torch", "sentence_transformers", "FlagEmbedding", "transformers",
         "tkinter", "matplotlib",
+        "fitz", "pymupdf",     # Public distribution uses pypdf instead.
         # Exclude Qt bindings — pywebview uses the OS webview (Edge/Chromium on Windows,
         # WebKit on macOS), not Qt. Some transitive dependency pulls these in; block them.
         "PyQt5", "PyQt6", "PySide2", "PySide6",

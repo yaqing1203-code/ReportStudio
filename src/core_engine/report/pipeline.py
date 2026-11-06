@@ -1,38 +1,13 @@
-"""Report-generation pipeline — the linear orchestrator.
+"""Question-led reporting with bounded recovery and auditable analytical judgments.
 
-This is the top-level flow the pivot asked for. It is deliberately a strict,
-deterministic state machine, NOT an autonomous agent loop: each stage either
-advances or halts with a typed PipelineResult. The verification harness is the
-gate every path must clear before any LaTeX is produced.
+Plan -> gather -> extract/verify -> source-bind premises -> assess evidence gaps
+     -> bounded supplemental search and re-verification -> question coverage gate
+     -> draft/audit factual prose -> metric calculations and chart validation
+     -> separate analytical judgments + critical review -> render/compile.
 
-    topic
-      │
-      ▼
-   [1] gather_sources ── search → STRICT source filter → fetch survivors
-      │                  (only .gov / IGO / .edu / allowlisted media reach here)
-      ▼
-   [2] SCOPE GATE (pre-verify) ── enough distinct authoritative domains?
-      │   no → OUT_OF_SCOPE (polite halt, exact mandated message)
-      ▼
-   [3] extract claims (LLM proposes; never trusted as truth)
-      │
-      ▼
-   [4] VERIFY (triple-check + cross-reference) ──┐ blocked?
-      │                                          │  re-scrape / re-verify
-      │◄─────────────────────────────────────────┘  up to max_reverify_attempts
-      ▼
-   [5] SCOPE GATE (post-verify) ── enough VERIFIED claims + domains?
-      │   no → OUT_OF_SCOPE
-      ▼
-   [6] assemble ReportData (verified claims only)
-      │
-      ▼
-   [7] render LaTeX → [8] compile PDF (degrades to .tex if no TeX toolchain)
-      │
-      ▼
-   COMPLETED
-
-Every decision is appended to result.trace for a full audit.
+Document-only runs never search the web. Supplemental research has hard query,
+round, page and time limits. Unsupported requests produce an evidence-gap artifact.
+Model-proposed interpretations are labeled inferences, never source assertions.
 """
 from __future__ import annotations
 
@@ -41,15 +16,24 @@ import json
 import logging
 import re
 import time
+from collections import Counter
 from collections.abc import Callable
+from dataclasses import asdict, replace
 from typing import ClassVar
 
 from core_engine.config import get_settings
 from core_engine.report import charts as charts_mod
+from core_engine.report.answerability import assess_coverage
+from core_engine.report.chart_audit import validate_charts
 from core_engine.report.compile import CompileError, compile_pdf, engine_available
+from core_engine.report.discovery import discovery_query, equivalent_terms
+from core_engine.report.evidence_quality import assess_evidence, origin_groups
+from core_engine.report.generation import profile_audit
+from core_engine.report.grounding import AnchorReuse, SentenceGrounder, parse_draft, write_evidence
 from core_engine.report.kg import ReportKnowledgeGraph, build_report_kg
 from core_engine.report.latex import write_tex
 from core_engine.report.llm import LLM, get_llm
+from core_engine.report.metrics import catalog_from_claims
 from core_engine.report.models import (
     Claim,
     DeepDive,
@@ -57,9 +41,21 @@ from core_engine.report.models import (
     PipelineStatus,
     ReportData,
     ReportSection,
+    ReportSentence,
+    SentenceCitation,
     Source,
     out_of_scope_message,
 )
+from core_engine.report.publication import apply_policy, lead_records
+from core_engine.report.reasoning import analyze
+from core_engine.report.research import (
+    ResearchPlan,
+    ResearchSession,
+    build_plan,
+    evidence_requirement,
+    related,
+)
+from core_engine.report.scientific import comparison_audit, table_candidates
 from core_engine.report.scrape import (
     Fetcher,
     SearchProvider,
@@ -67,7 +63,9 @@ from core_engine.report.scrape import (
     gather_sources,
     get_fetcher,
     get_search_provider,
+    retryable_fetch_failure,
 )
+from core_engine.report.text import normalize_text, numeric_tokens
 from core_engine.report.verify import VerificationHarness, VerificationReport
 
 log = logging.getLogger(__name__)
@@ -160,7 +158,11 @@ class ReportPipeline:
         on_progress: ProgressFn | None = None,
         extra_sources: list[Source] | None = None,
         skip_search: bool = False,
+        skip_initial_search: bool = False,
         confirmation_gate: ConfirmationGate | None = None,
+        research_plan: ResearchPlan | None = None,
+        seed_claims: list[Claim] | None = None,
+        retained_leads: list[dict] | None = None,
     ) -> PipelineResult:
         """Run the pipeline. `on_progress(stage, detail)` is called at each phase so a
         GUI can show live status ('Scraping…', 'Verifying…', 'Generating LaTeX…'). It is
@@ -174,6 +176,8 @@ class ReportPipeline:
           - `skip_search`: do NOT hit the web search/fetch layer; build the report purely
             from `extra_sources`. Used by the 'comprehensive' step so it enriches the
             brief with the user's documents instead of re-searching.
+          - `skip_initial_search`: resume from supplied sources and target evidence
+            gaps online, without repeating the broad initial collection.
 
         HITL hook (workflow F): when `confirmation_gate` is given AND
         settings.hitl_on_isolated_core_claim is enabled, the run pauses after
@@ -185,8 +189,23 @@ class ReportPipeline:
         """
         emit = _make_emitter(on_progress)
         result = PipelineResult(status=PipelineStatus.ERROR, topic=topic)
+        generation_profile = profile_audit(self._s) if self._s.generation_depth else None
+        if generation_profile:
+            result.log("generation_profile", **generation_profile)
+            result.research_audit["generation_profile"] = generation_profile
         topic = topic.strip()
+        result.topic = topic
         extra_sources = extra_sources or []
+        anchor_reuse = AnchorReuse()
+        self._extraction_cache: dict = {}
+        self._candidate_archive: dict[str, Claim] = {}
+        for index, lead in enumerate(retained_leads or [], 1):
+            candidate = Claim(f"retained_{index}", lead["text"], candidate_source_urls=lead.get("candidate_source_urls", []))
+            self._candidate_archive[normalize_text(candidate.text)] = candidate
+        self._research_questions: list[str] = []
+        self._local_claims: list[Claim] = []
+        self._next_local_id = max([self._s.extraction_max_claims] + [int(c.id[1:]) for c in (seed_claims or [])
+                                                                 if re.fullmatch(r"c\d+", c.id)])
         if not topic:
             result.status = PipelineStatus.OUT_OF_SCOPE
             result.message = out_of_scope_message(self._s.report_locale)
@@ -195,12 +214,34 @@ class ReportPipeline:
             return result
 
         try:
+            if skip_initial_search and not extra_sources:
+                raise ValueError("Resuming evidence-gap research requires supplied source snapshots")
+            if seed_claims and len({c.id for c in seed_claims}) != len(seed_claims):
+                raise ValueError("Seed claim identifiers must be unique")
+            session = None
+            if self._s.research_enabled:
+                emit("planning_start", "Planning research questions and evidence requirements…")
+                if research_plan is None:
+                    research_plan = await build_plan(topic, self._llm, self._s)
+                if (research_plan.objective != topic or not research_plan.questions
+                        or research_plan.questions[0].question != topic or not research_plan.questions[0].required):
+                    raise ValueError("A replayed research plan must preserve the exact task and questions")
+                self._research_questions = [q.question + " " + evidence_requirement(research_plan, q, self._s.report_locale)
+                                            for q in research_plan.questions]
+                session = ResearchSession(research_plan, self._llm, self._s, anchor_reuse=anchor_reuse)
+                if generation_profile:
+                    session.audit["generation_profile"] = generation_profile
+                result.research_plan = research_plan.to_dict()
+                result.log("research_plan", **result.research_plan)
+                emit("planning_done", f"Planned {len(research_plan.questions)} question(s) with explicit evidence requirements.")
             rejected: list = []
-            if skip_search:
+            initial_search_diagnostics: list[dict] = []
+            if skip_search or skip_initial_search:
                 # Comprehensive step: no web search — the pool IS the injected sources.
                 emit("scraping_start",
                      f"Using {len(extra_sources)} stored/uploaded source(s); "
-                     "skipping web search…")
+                     + ("skipping broad collection; evidence-gap searches remain enabled…"
+                        if skip_initial_search and not skip_search else "skipping web search…"))
                 sources = _merge_sources([], extra_sources)
                 emit("scraping_done",
                      f"Prepared {len(sources)} source(s) from the database.")
@@ -219,13 +260,22 @@ class ReportPipeline:
                         # lets gather route per query type via the search router.
                         topic, None if self._search_is_default else self._search,
                         self._fetcher,
-                        on_progress=_gather_progress, llm=self._llm)
+                        max_pages=(max(0 if extra_sources else 1, self._s.scrape_max_pages - len(extra_sources)
+                            - min(len(session.plan.questions), self._s.research_max_queries, self._s.research_max_rounds * 2))
+                            if session else None),
+                        on_progress=_gather_progress, llm=self._llm,
+                        queries=session.plan.initial_queries() if session else None, settings=self._s,
+                        diagnostics=initial_search_diagnostics)
                 except SearchUnavailableError as e:
                     # Search backend blocked/unconfigured — this is NOT 'out of scope'.
                     # Surface the real, actionable reason (the DDG-block masking bug).
                     result.status = PipelineStatus.ERROR
                     result.message = f"Search unavailable: {e}"
-                    result.log("gather", ok=False, error=str(e))
+                    result.log("gather", ok=False, error=str(e), query_diagnostics=initial_search_diagnostics)
+                    if session is not None:
+                        session.audit["initial_queries"] = initial_search_diagnostics
+                        session.audit["stop_reason"] = "initial_retrieval_error"
+                        result.research_audit = session.audit
                     emit("error", f"Search unavailable: {e}")
                     return result
                 # Merge any injected sources (brief sources + user docs) with the freshly
@@ -233,18 +283,47 @@ class ReportPipeline:
                 sources = _merge_sources(fetched, extra_sources)
                 result.log("gather", authoritative=len(sources), rejected=len(rejected),
                            injected=len(extra_sources),
+                           query_diagnostics=initial_search_diagnostics,
                            kept_domains=sorted({s.domain for s in sources}))
                 emit("scraping_done",
                      f"Collected {len(sources)} source(s) ({len(rejected)} discarded"
                      + (f", {len(extra_sources)} user-provided" if extra_sources else "")
                      + ").")
 
+            verification = None
+            if session is not None:
+                session.audit["initial_rejections"] = [{"url": hit.url, "reason": hit.metadata.get("rejection_reason", "source_filter")}
+                                                        for hit in rejected]
+                session.audit["initial_queries"] = [] if skip_search or skip_initial_search else [
+                    {"query": query, "question_id": next(q.id for q in session.plan.questions if q.question == query),
+                     "kind": next(q.kind for q in session.plan.questions if q.question == query),
+                     **next((record for record in initial_search_diagnostics if record["query"] == query),
+                            {"status": "completed"})}
+                    for query in session.plan.initial_queries()]
+                verification = (await self._extract_and_verify(topic, sources, result, emit,
+                                    bounded_research=True, candidate_claims=seed_claims,
+                                    isolation_reviews=session.isolation_reviews) if sources else VerificationReport())
+                sources, verification = await self._fill_evidence_gaps(
+                    session, sources, verification, result, emit, skip_search=skip_search)
+                result.research_audit, result.research_evidence = session.audit, session.evidence
+                result.log("research_summary", **session.audit)
+
             # --- Scope gate #1: do we even have enough footing to proceed? ---
             # Count distinct authoritative domains directly off the Source objects'
             # assigned kind, NOT by re-classifying the URL — user-provided documents have
             # synthetic URLs that the allowlist would reject, but they ARE authoritative.
             domains = _distinct_authoritative_domains(sources)
-            if len(domains) < self._s.min_authoritative_sources:
+            grounded_coverage = assess_coverage(topic, session.claims, sources, topic_aliases=equivalent_terms(topic)) if session else None
+            sparse_eligible = bool(self._s.sparse_evidence_enabled and session and session.claims and grounded_coverage
+                                   and grounded_coverage.status != "insufficient")
+            origins = len(set(origin_groups(sources).values()))
+            limited_evidence = bool(sparse_eligible and (origins < self._s.min_authoritative_sources
+                                   or (verification is not None and verification.kept_count < self._s.min_total_claims)))
+            if limited_evidence:
+                session.audit["evidence_mode"] = "limited_evidence"
+                result.log("sparse_evidence", mode="limited_evidence", origin_groups=origins,
+                           source_urls=len(sources), truth_established=False)
+            if origins < self._s.min_authoritative_sources and not sparse_eligible:
                 # Distinguish the failure modes so the reason is actionable, not a
                 # generic 'out of scope' for what is really a data-gathering shortfall.
                 if not sources and not rejected:
@@ -254,40 +333,71 @@ class ReportPipeline:
                     reason = (f"found {len(rejected)} page(s) but none passed the source "
                               f"filter or relevance check")
                 else:
-                    reason = (f"only {len(domains)} distinct source domain(s); "
+                    reason = (f"only {origins} distinguishable source origin(s) across {len(domains)} domain(s); "
                               f"need {self._s.min_authoritative_sources}")
                 emit("scraping", f"Insufficient sources: {reason}.")
-                return self._out_of_scope(result, reason)
+                result.answerability = {"status": "insufficient", "missing": ["authoritative_sources"],
+                                        "reason": reason}
+                result.log("scope_gate", ok=False, reason=reason)
+                return self._unanswerable(result, sources, emit)
 
             # --- Extract + verify, with bounded re-verify loop ---
             accept_first = self._s.verify_strategy in ("conflict_only", "aligned")
             emit("verifying_start",
-                 "Accepting claims and resolving conflicts…" if accept_first
+                 "Retaining candidates and reviewing disagreements…" if accept_first
                  else "Cross-verifying claims across sources…")
-            verification = await self._extract_and_verify(topic, sources, result, emit)
-            if accept_first:
-                dropped = len(verification.rejected_claims)
-                emit("verifying_done",
-                     f"Accepted {verification.kept_count} claim(s); "
-                     f"dropped {dropped} conflicting claim(s).")
+            if verification is None:
+                verification = await self._extract_and_verify(topic, sources, result, emit,
+                    bounded_research=skip_search, candidate_claims=seed_claims,
+                    isolation_reviews=session.isolation_reviews if session is not None else None)
+            # Every strategy passes this gate, including runs without research.
+            # Retention/authority alone never makes an observation publishable.
+            candidates = list({c.id: c for c in verification.kept_claims + verification.rejected_claims}.values())
+            present = {normalize_text(c.text) for c in candidates}
+            used_ids = {c.id for c in candidates}
+            for index, claim in enumerate(self._candidate_archive.values(), 1):
+                if normalize_text(claim.text) in present:
+                    continue
+                identifier = f"lead_{index}"
+                while identifier in used_ids:
+                    identifier += "_retained"
+                used_ids.add(identifier)
+                # Earlier retrieval rounds must not silently lose candidates.
+                # New IDs prevent a later extraction's IDs from borrowing old proof.
+                candidates.append(replace(claim, id=identifier, evidence=[], verified=False,
+                                          confidence=None, conflicting_claim_ids=[]))
+            if session is not None:
+                source_citations = [SentenceCitation(**c) for c in session.evidence.get("citations", [])]
             else:
-                n_high = sum(1 for c in verification.verified_claims)
-                n_rumor = len(verification.rumor_claims)
-                emit("verifying_done",
-                     f"Classified {verification.kept_count} claim(s): {n_high} verified, "
-                     f"{n_rumor} unverified/rumor.")
+                _, source_citations = await SentenceGrounder(
+                    self._llm, self._s, anchor_reuse=anchor_reuse).anchor_claims(candidates, sources)
+            result.evidence_policy = apply_policy(candidates, sources, source_citations)
+            verification.kept_claims = [c for c in candidates if c.reporting_status != "lead_only"]
+            verification.rejected_claims = [c for c in candidates if c.reporting_status == "lead_only"]
+            result.evidence_policy["leads"] = lead_records(candidates)
+            if session is None:
+                result.research_evidence = {"claims": [asdict(c) for c in candidates],
+                                           "citations": [asdict(c) for c in source_citations]}
+            result.log("publication_policy", **result.evidence_policy)
+            emit("verifying_done", f"Source-bound: {len(verification.verified_claims)}; "
+                 f"disputed: {result.evidence_policy['disputed']}; leads: {result.evidence_policy['lead_only']}.")
 
             # --- Scope gate #2: broad-collection model. A report is out-of-scope only
             #     if too FEW claims survive at ANY tier (rumors included). Rumors are
             #     kept and labeled, so they count toward having something to analyze. ---
-            if verification.kept_count < self._s.min_total_claims:
-                return self._out_of_scope(
-                    result,
-                    f"post-verification: only {verification.kept_count} claim(s) "
-                    f"survived (need {self._s.min_total_claims}); "
-                    f"{verification.verified_count} verified, "
-                    f"{len(verification.rumor_claims)} rumor",
-                )
+            if verification.kept_count < self._s.min_total_claims and not sparse_eligible:
+                result.answerability = {"status": "insufficient", "missing": ["supported_claims"],
+                                        "kept_claims": verification.kept_count,
+                                        "required_claims": self._s.min_total_claims}
+                result.log("scope_gate", ok=False, reason="too few supported claims")
+                return self._unanswerable(result, sources, emit)
+
+            coverage = assess_coverage(topic, session.claims if session and session.audit["questions"]
+                                       else verification.kept_claims, sources, topic_aliases=equivalent_terms(topic))
+            result.answerability = coverage.to_dict()
+            result.log("answerability", **result.answerability)
+            if coverage.status == "insufficient":
+                return self._unanswerable(result, sources, emit)
 
             # --- HITL checkpoint (workflow F, default OFF): if core isolated claims
             #     survived verification, pause for a human decision before assembly. ---
@@ -304,9 +414,75 @@ class ReportPipeline:
                     emit("blocked", result.message)
                     return result
 
-            # --- Assemble the report payload (verified facts + labeled rumors) ---
+            # --- Assemble attributed statements, disagreements and retained leads ---
             emit("analyzing_start", "Synthesizing knowledge graph and analysis…")
-            report = await self._assemble(topic, verification, sources)
+            focus_ids = None
+            if session and session.plan.requested_metrics:
+                focus_ids = {cid for row in session.audit["questions"] for cid in row["claim_ids"]}
+                focus_ids.update(c.id for c in verification.kept_claims if related(topic, c.text))
+            report = await self._assemble(topic, verification, sources, research_plan=result.research_plan,
+                                          focus_claim_ids=focus_ids)
+            report.research_plan, report.research_audit = result.research_plan, result.research_audit
+            report.research_evidence = result.research_evidence
+            report.evidence_policy = result.evidence_policy
+            emit("grounding_start", "Auditing each draft sentence against source passages…")
+            report = await SentenceGrounder(self._llm, self._s, anchor_reuse=anchor_reuse).audit_report(report)
+            result.evidence_policy = report.evidence_policy
+            supported_ids = {cid for sentence in report.all_sentences() if sentence.status == "supported"
+                             for cid in sentence.claim_ids}
+            final_coverage = assess_coverage(topic, [c for c in report.claims + report.rumors + report.disputed_claims
+                                             if c.id in supported_ids], sources,
+                                             topic_aliases=equivalent_terms(topic))
+            result.answerability = final_coverage.to_dict()
+            result.log("grounded_answerability", **result.answerability)
+            if final_coverage.status == "insufficient":
+                return self._unanswerable(result, sources, emit)
+            report.answerability = result.answerability
+            if report.disputed_claims:
+                report.answerability["unresolved_source_conflicts"] = [c.id for c in report.disputed_claims]
+                report.answerability["status"] = "undetermined" if report.claims else "insufficient"
+                report.answerability["missing"] = list(dict.fromkeys([
+                    *report.answerability.get("missing", []), "unresolved_source_conflict"]))
+            report.source_quality = assess_evidence(report.claims + report.rumors + report.disputed_claims, sources, report.citations)
+            report.source_quality["evidence_mode"] = "limited_evidence" if limited_evidence else "standard"
+            metrics, metric_issues = catalog_from_claims(report.claims, report.citations, sources=report.sources)
+            if report.kg is not None:
+                graph, clusters, derived, calculations, chart_audit, calculation_issues = validate_charts(
+                    report.kg, metrics, report.claims, report.citations, verification.clusters)
+                report.kg, report.calculations, report.chart_audit = graph, calculations, chart_audit
+                metrics += derived
+                metric_issues += calculation_issues
+                blocks = charts_mod.build_all(graph, clusters) if self._s.enable_charts else {}
+                for section in report.sections:
+                    section.latex_blocks = self._section_charts(section.section_id, blocks)
+                    if section.latex_blocks:
+                        section.sentences = [s for s in section.sentences if not (
+                            s.status == "editorial" and s.text.startswith("Insufficient independently"))]
+                        section.paragraphs = [s.text for s in section.sentences if s.status != "withheld"]
+                report.grounding_audit["chart_blocks_requiring_review"] = (sum(
+                    entry["status"] == "withheld" for entry in chart_audit) if self._s.enable_charts else 0)
+            report.metrics = [metric.to_dict() for metric in metrics]
+            report.research_audit["scientific_comparisons"] = comparison_audit(metrics)
+            report.metric_issues = metric_issues
+            if session is not None:
+                emit("reasoning_start", "Analyzing implications, assumptions and rival explanations…")
+                report.analysis, report.analysis_audit = await analyze(
+                    result.research_plan, result.research_audit, result.research_evidence,
+                    report.calculations, report.metrics, self._llm, self._s)
+                result.log("analysis_audit", **report.analysis_audit)
+                emit("reasoning_done", f"{len(report.analysis)} analytical conclusion(s) retained; "
+                     f"{len(report.analysis_audit['withheld'])} withheld.")
+            if (metric_issues or report.grounding_audit["chart_blocks_requiring_review"] or limited_evidence
+                    or report.disputed_claims or report.leads):
+                report.quality_status = "needs_review"
+            if (session is not None and (session.audit.get("coverage_status") != "complete"
+                    or report.analysis or report.analysis_audit.get("withheld")
+                    or report.analysis_audit.get("status") in {"unavailable", "deadline"})):
+                report.quality_status = "needs_review"
+            result.log("sentence_grounding", **report.grounding_audit,
+                       quality_status=report.quality_status)
+            emit("grounding_done", f"{report.grounding_audit['supported_sentences']} sentence(s) supported; "
+                 f"{report.grounding_audit['withheld_sentences']} withheld for review.")
             result.report = report
             result.log("assemble", sections=len(report.sections),
                        verified_claims=len(report.claims),
@@ -317,15 +493,16 @@ class ReportPipeline:
 
             # --- Render LaTeX ---
             emit("generating_latex_start", "Generating LaTeX document…")
-            tex_path = write_tex(report)
+            tex_path = await asyncio.to_thread(write_tex, report, self._s.output_dir, settings=self._s)
             result.tex_path = str(tex_path)
+            result.evidence_path = str(await asyncio.to_thread(write_evidence, report, tex_path))
             result.log("render", tex=str(tex_path))
             emit("generating_latex_done", "LaTeX document generated.")
 
             # --- Compile PDF (degrade gracefully if no toolchain) ---
             if compile_to_pdf:
                 emit("compiling_start", "Compiling PDF…")
-                if not engine_available():
+                if not engine_available(self._s.latex_engine):
                     result.status = PipelineStatus.COMPLETED
                     result.message = (
                         f"Report generated. LaTeX written to {tex_path.name}; PDF "
@@ -334,7 +511,7 @@ class ReportPipeline:
                     result.log("compile", ok=False, reason="engine unavailable")
                     return result
                 try:
-                    pdf_path = compile_pdf(tex_path)
+                    pdf_path = await asyncio.to_thread(compile_pdf, tex_path, settings=self._s)
                     result.pdf_path = str(pdf_path)
                     result.log("compile", ok=True, pdf=str(pdf_path))
                     emit("compiling_done", "PDF compiled.")
@@ -345,8 +522,12 @@ class ReportPipeline:
                     return result
 
             result.status = PipelineStatus.COMPLETED
-            result.message = "Report generated and verified."
-            emit("completed", "Report generated and verified.")
+            result.message = (
+                "Report generated with sentence-level source citations."
+                if report.quality_status == "source_supported" else
+                "Review draft generated; inspect research gaps, analytical judgments and the evidence audit."
+            )
+            emit("completed", result.message)
             return result
 
         except Exception as e:  # never leak a stack trace as the product
@@ -359,7 +540,8 @@ class ReportPipeline:
     # ------------------------------------------------------------------
     async def _extract_and_verify(
         self, topic: str, sources: list[Source], result: PipelineResult,
-        emit=None,
+        emit=None, *, bounded_research=False, candidate_claims=None, strict_context=False,
+        isolation_reviews: dict[tuple[str, str], str] | None = None,
     ) -> VerificationReport:
         """Extract candidate claims and run the harness, retrying up to
         max_reverify_attempts. Each retry widens the candidate source set for a
@@ -371,7 +553,25 @@ class ReportPipeline:
 
         _emit("extracting_start",
               f"Extracting candidate claims from {len(sources)} source(s)…")
-        claims = await self._extract_claims(sources, on_progress=_emit)
+        if candidate_claims is None:
+            extraction_audit: list[dict] = []
+            try:
+                claims = await self._extract_claims(sources, on_progress=_emit, audit=extraction_audit)
+            finally:
+                result.log("extraction_sources", sources=extraction_audit)
+            local = getattr(self, "_local_claims", [])
+            local_text = {normalize_text(c.text) for c in local}
+            claims = [c for c in claims if normalize_text(c.text) not in local_text]
+            claims = claims[:max(0, self._s.extraction_max_claims - len(local))] + local
+        else:
+            claims = candidate_claims[:self._s.extraction_max_claims]
+        claims = [replace(c, evidence=[], verified=False, confidence=None, verification_rounds=0,
+                          candidate_source_urls=list(c.candidate_source_urls), conflicting_claim_ids=[])
+                  for c in claims]
+        archive = getattr(self, "_candidate_archive", None)
+        if archive is not None:
+            for claim in claims:
+                archive[normalize_text(claim.text)] = claim
         result.log("extract", candidate_claims=len(claims))
         _emit("extracting_done", f"Extracted {len(claims)} candidate claim(s).")
 
@@ -380,11 +580,18 @@ class ReportPipeline:
             _emit("verifying_progress",
                   f"Verifying claim {i}/{total}: {text[:60]}")
 
+        # The research loop owns all supplemental retrieval. The old isolated-claim
+        # proxy search must not escape its budget, or document-only mode.
+        harness = self._harness
+        if bounded_research or strict_context:
+            harness = VerificationHarness(self._llm, fetcher=self._fetcher)
+            harness._s = self._s.model_copy(update={"active_verify_enabled": False,
+                **({"verify_strategy": "cross_reference", "verify_mode": "strict"} if strict_context else {})})
         attempt = 0
         _emit("verifying_progress",
               f"Classifying {len(claims)} claim(s) across {self._s.verify_rounds} rounds…")
-        verification = await self._harness.verify(
-            claims, sources, on_progress=_claim_progress)
+        verification = await harness.verify(claims, sources, on_progress=_claim_progress,
+                                            isolation_reviews=isolation_reviews)
         result.log("verify", attempt=attempt, verified=verification.verified_count,
                    kept=verification.kept_count,
                    rejected=len(verification.rejected_claims),
@@ -399,19 +606,269 @@ class ReportPipeline:
         # strategies (conflict_only / aligned) are deterministic over a fixed claim set —
         # re-running cannot surface more claims and would re-accept (duplicating
         # evidence), so we never loop them.
-        while (self._s.verify_strategy not in ("conflict_only", "aligned")
+        while (not bounded_research and self._s.verify_strategy not in ("conflict_only", "aligned")
                and verification.kept_count < self._s.min_total_claims
                and not verification.timed_out
                and attempt < self._s.max_reverify_attempts):
             attempt += 1
             _emit("verifying_progress", f"Below threshold — re-verifying (attempt {attempt + 1})…")
-            verification = await self._harness.verify(
+            verification = await harness.verify(
                 claims, sources, on_progress=_claim_progress)
             result.log("verify", attempt=attempt, verified=verification.verified_count,
                        kept=verification.kept_count,
                        rejected=len(verification.rejected_claims),
                        rounds=verification.rounds_run, timed_out=verification.timed_out)
 
+        return verification
+
+    async def _fill_evidence_gaps(self, session, sources, verification, result, emit, *, skip_search):
+        deadline = time.monotonic() + self._s.research_deadline_s
+        queries_used = 0
+        rejected_urls = {row["url"] for row in session.audit.get("initial_rejections", [])
+                         if not retryable_fetch_failure(row.get("reason"))}
+        session.audit["search_policy"] = "document_only" if skip_search else "web_allowed"
+        session.audit["disagreements"] = [c for c in verification.clusters if c.get("relation") == "conflict"]
+
+        async def bounded(awaitable):
+            return await asyncio.wait_for(awaitable, timeout=max(0.001, deadline - time.monotonic()))
+
+        try:
+            emit("research_audit", "Mapping source-supported evidence to the research questions…")
+            await bounded(session.evaluate(verification.kept_claims, sources))
+            local_possible = self._s.research_local_max_chunks > 0 and any(s.metadata.get("full_text_accessed") for s in sources)
+            if skip_search and not local_possible:
+                session.audit["stop_reason"] = "document_only"
+                return sources, verification
+            if self._s.research_max_rounds == 0 or (self._s.research_max_queries == 0 and not local_possible):
+                session.audit["stop_reason"] = "document_only" if skip_search else "retrieval_disabled"
+                return sources, verification
+            for round_number in range(1, self._s.research_max_rounds + 1):
+                searched_questions = {row["question_id"] for row in session.audit["searches"]}
+                unsearched = {row["id"] for row in session.audit["questions"]
+                              if row["status"] != "supported" and row["id"] not in searched_questions}
+                if (session.audit["coverage_status"] == "complete"
+                        and len(set(origin_groups(sources).values())) >= self._s.min_authoritative_sources):
+                    session.audit["stop_reason"] = "document_only" if skip_search else "questions_covered"
+                    break
+                if self._s.research_fulltext_enabled and not skip_search:
+                    from core_engine.report.fulltext import fulltext_candidates
+
+                    past_attempts = session.audit.get("fulltext_attempts", [])
+                    counts = Counter(row["url"] for row in past_attempts)
+                    blocked = {row["url"] for row in past_attempts if row.get("status") == "retrieved"
+                               or not retryable_fetch_failure(row.get("reason"))}
+                    fulltexts = sum(bool(s.metadata.get("fulltext_parent_url")) for s in sources)
+                    leads = [h for h in fulltext_candidates(sources, self._s.research_fulltext_locations_per_work)
+                             if h.url not in blocked and counts[h.url] < 2 and h.url not in rejected_urls]
+                    allowance = min(self._s.research_fulltext_max_documents - fulltexts,
+                                    self._s.scrape_max_pages - len(sources) - len(unsearched),
+                                    self._s.research_fulltext_max_documents * self._s.research_fulltext_locations_per_work - len(past_attempts))
+                    if leads and allowance > 0:
+                        # Follow locations from fetched records, with no extra web search.
+                        leads = leads[:allowance]
+
+                        class OpenCopyLeads:
+                            def __init__(self, hits):
+                                self.hits = hits
+
+                            async def search(self, _topic, *, max_results):
+                                return self.hits[:max_results]
+
+                        emit("fulltext_start", f"Reading {len(leads)} open full-text candidate(s)…")
+                        attempts = [{"url": h.url, "parent_url": h.metadata["fulltext_parent_url"],
+                                     "round": round_number, "status": "started"} for h in leads]
+                        session.audit.setdefault("fulltext_attempts", []).extend(attempts)
+                        try:
+                            copies, rejected = await bounded(gather_sources(
+                                session.plan.objective, OpenCopyLeads(leads), self._fetcher,
+                                queries=[session.plan.objective], max_pages=len(leads),
+                                settings=self._s.model_copy(update={"max_pages_per_query": len(leads)})))
+                        except BaseException as exc:
+                            for attempt in attempts:
+                                attempt.update(status="deadline" if isinstance(exc, TimeoutError) else "error",
+                                               error_type=type(exc).__name__)
+                            raise
+                        by_url = {s.metadata.get("retrieval_entry_url", s.url): s for s in copies}
+                        failures = {h.url: h.metadata.get("rejection_reason", "source_filter") for h in rejected}
+                        for attempt in attempts:
+                            url = attempt["url"]
+                            attempt.update(status="retrieved" if url in by_url else "rejected", reason=failures.get(url),
+                                retrieved_url=by_url[url].url if url in by_url else None,
+                                format=by_url[url].document_format if url in by_url else None)
+                        if copies:
+                            candidate_sources = _merge_sources(sources, copies)
+                            sources = candidate_sources  # retain fetched originals even if later checks time out
+                            candidate = await bounded(self._extract_and_verify(session.plan.objective, candidate_sources,
+                                result, emit, bounded_research=True, isolation_reviews=session.isolation_reviews))
+                            await bounded(session.evaluate(candidate.kept_claims, candidate_sources))
+                            sources, verification = candidate_sources, candidate
+                        emit("fulltext_done", f"Read {len(copies)} full-text document(s); retained abstract limitations for other works.")
+                local_remaining = self._s.research_local_max_chunks - len(session.audit.get("local_reads", []))
+                previous_reads = len(session.audit.get("local_reads", []))
+                if local_remaining > 0 and (skip_search or not unsearched
+                        or queries_used >= self._s.research_max_queries or len(sources) >= self._s.scrape_max_pages):
+                    verification = await bounded(self._read_local_gaps(session, sources, verification, result, emit,
+                                                                       min(2, local_remaining)))
+                if skip_search:
+                    session.audit["stop_reason"] = "document_only"
+                    if (len(session.audit.get("local_reads", [])) > previous_reads
+                            and len(session.audit["local_reads"]) < self._s.research_local_max_chunks):
+                        continue
+                    break
+                if (session.audit["coverage_status"] == "complete"
+                        and len(set(origin_groups(sources).values())) >= self._s.min_authoritative_sources):
+                    session.audit["stop_reason"] = "questions_covered"
+                    break
+                remaining_queries = self._s.research_max_queries - queries_used
+                remaining_pages = self._s.scrape_max_pages - len(sources)
+                if remaining_queries <= 0 or remaining_pages <= 0:
+                    session.audit["stop_reason"] = "query_budget" if remaining_queries <= 0 else "source_budget"
+                    if (len(session.audit.get("local_reads", [])) > previous_reads
+                            and len(session.audit["local_reads"]) < self._s.research_local_max_chunks):
+                        continue
+                    break
+                # Give every uncovered question a first search before repeated
+                # deep reads consume the shared wall-clock budget.
+                queries = session.next_queries(min(remaining_queries, max(2, len(unsearched))))
+                if not queries and len(set(origin_groups(sources).values())) < self._s.min_authoritative_sources:
+                    for _ in range(min(remaining_queries, 2)):
+                        key = ("q1", "source_diversity")
+                        attempt = session.query_attempts.get(key, 0)
+                        if attempt >= 4:
+                            break
+                        strategy, query = discovery_query(session.plan.objective, "source_diversity", attempt, session.plan.search_terms)
+                        session.query_attempts[key] = attempt + 1
+                        if normalize_text(query) not in session.used_queries:
+                            session.used_queries.add(normalize_text(query))
+                            queries.append({"question_id": "q1", "gap": "source_diversity", "kind": "fact", "strategy": strategy, "query": query})
+                if not queries:
+                    session.audit["stop_reason"] = "no_new_queries"
+                    break
+                emit("gap_search_start", f"Research round {round_number}: searching {len(queries)} evidence gap(s)…")
+                # Reserve a document slot for each pending question that has not
+                # received its first search. Query fairness alone is insufficient
+                # if early questions exhaust the entire retained-source budget.
+                future_questions = unsearched - {q["question_id"] for q in queries}
+                round_pages = min(remaining_pages, max(len(queries), remaining_pages - len(future_questions)))
+                searches = [{**query, "round": round_number, "status": "started"} for query in queries]
+                session.audit["searches"].extend(searches)
+                queries_used += len(searches)
+                session.audit["queries_used"] = queries_used
+                query_diagnostics: list[dict] = []
+                try:
+                    fetched, rejected = await bounded(gather_sources(
+                        session.plan.objective, None if self._search_is_default else self._search, self._fetcher,
+                        queries=[query["query"] for query in queries], exclude_urls={s.url for s in sources} | rejected_urls,
+                        max_pages=round_pages, settings=self._s, llm=self._llm, diagnostics=query_diagnostics,
+                        search_purpose="gap",
+                        on_progress=lambda _done, _total, detail: emit("gap_search_progress", detail)))
+                finally:
+                    for search in searches:
+                        detail = next((row for row in query_diagnostics if row["query"] == search["query"]), None)
+                        if detail is not None:
+                            search.update(detail)
+                            search["rejected_urls"] = [row["url"] for row in detail.get("rejections", [])]
+                rejected_urls.update(hit.url for hit in rejected if not retryable_fetch_failure(hit.metadata.get("rejection_reason")))
+                if not fetched:
+                    session.audit["stop_reason"] = "no_new_sources"
+                    if queries_used < self._s.research_max_queries and round_number < self._s.research_max_rounds:
+                        continue
+                    break
+                candidate_sources = _merge_sources(sources, fetched)
+                sources = candidate_sources  # unverified data stays a source/lead, never a coverage witness
+                candidate = await bounded(self._extract_and_verify(session.plan.objective, candidate_sources,
+                    result, emit, bounded_research=True, isolation_reviews=session.isolation_reviews))
+                previous = {normalize_text(c.text) for c in session.claims}
+                await bounded(session.evaluate(candidate.kept_claims, candidate_sources))
+                sources, verification = candidate_sources, candidate
+                gained = len({normalize_text(c.text) for c in session.claims} - previous)
+                session.audit["rounds"].append({"round": round_number, "new_sources": len(fetched),
+                                                "new_grounded_claims": gained,
+                                                "question_statuses": {q["id"]: q["status"] for q in session.audit["questions"]}})
+                emit("gap_search_done", f"Added {gained} source-supported observation(s); reassessed research gaps.")
+                if (session.audit["coverage_status"] == "complete"
+                        and len(set(origin_groups(sources).values())) >= self._s.min_authoritative_sources):
+                    session.audit["stop_reason"] = "questions_covered"
+                    break
+                if gained == 0:
+                    session.audit["stop_reason"] = "no_new_evidence"
+                    if queries_used < self._s.research_max_queries and round_number < self._s.research_max_rounds:
+                        continue
+                    break
+            else:
+                session.audit["stop_reason"] = "round_budget"
+        except TimeoutError:
+            session.audit["stop_reason"] = "deadline"
+            for search in session.audit["searches"]:
+                if search["status"] == "started":
+                    search["status"] = "deadline"
+            for read in session.audit.get("local_reads", []):
+                if not read.get("round_completed"):
+                    read["status"] = "deadline"
+        except Exception as exc:
+            session.audit["stop_reason"] = "retrieval_error"
+            session.audit["error_type"] = type(exc).__name__
+            for search in session.audit["searches"]:
+                if search["status"] == "started":
+                    search["status"] = "error"
+        session.audit["queries_used"] = queries_used
+        session.audit["disagreements"] = [c for c in verification.clusters if c.get("relation") == "conflict"]
+        return sources, verification
+
+    async def _read_local_gaps(self, session, sources, verification, result, emit, available):
+        remaining = self._s.extraction_max_claims - len(verification.kept_claims)
+        if remaining <= 0:
+            return verification
+        jobs = session.next_local_reads(sources, min(available, remaining))
+        if not jobs:
+            return verification
+        emit("local_read_start", f"Reading {len(jobs)} original passage(s) for specific evidence gaps…")
+        by_url = {source.url: source for source in sources}
+        new_claims = []
+        known = {normalize_text(c.text) for c in verification.kept_claims}
+        records = []
+        for job in jobs:
+            record = {**job, "status": "started"}
+            session.audit.setdefault("local_reads", []).append(record)
+            records.append(record)
+            source = by_url[job["source_url"]]
+            start, end = job["start"], job["end"]
+            excerpt = source.text[start:end]
+            try:
+                extractor = getattr(self._llm, "extract_research_claims", None)
+                goal = next(q.question for q in session.plan.questions if q.id == job["question_id"])
+                extracted = (await extractor(source.url, excerpt, [goal, "Missing evidence ONLY: " + job["gap"]], max_claims=3)
+                             if extractor else await self._llm.extract_claims(source.url, excerpt))
+                added = []
+                for item in extracted[:min(3, remaining - len(new_claims))]:
+                    if not item.text.strip() or normalize_text(item.text) in known:
+                        continue
+                    known.add(normalize_text(item.text))
+                    self._next_local_id += 1
+                    position = excerpt.find(item.source_quote) if item.source_quote else -1
+                    span = [start, end] if position < 0 else [start + max(0, position - 300),
+                            min(end, start + position + len(item.source_quote) + 300)]
+                    claim = Claim(f"c{self._next_local_id}", item.text, candidate_source_urls=[source.url],
+                        credibility=source.credibility, entity=item.entity, attribute=item.attribute, value=item.value,
+                        qualifier=item.qualifier, time_scope=item.time_scope, metric=item.metric,
+                        source_windows={source.url: [span]})
+                    new_claims.append(claim)
+                    added.append(claim.id)
+                record.update(status="extracted" if added else "no_new_claims", candidate_claim_ids=added)
+            except Exception as exc:
+                record.update(status="error", error_type=type(exc).__name__)
+        if new_claims:
+            candidate = await self._extract_and_verify(session.plan.objective, sources, result, emit,
+                bounded_research=True, candidate_claims=verification.kept_claims + new_claims, strict_context=True)
+            await session.evaluate(candidate.kept_claims, sources)
+            anchored_ids = {c.id for c in session.claims}
+            for record in records:
+                record["anchored_claim_ids"] = [cid for cid in record.get("candidate_claim_ids", []) if cid in anchored_ids]
+            self._local_claims.extend(c for c in candidate.kept_claims if c.id in {n.id for n in new_claims} & anchored_ids)
+            verification = candidate
+        for record in records:
+            record["round_completed"] = True
+        emit("local_read_done", f"Located {sum(len(r.get('anchored_claim_ids', [])) for r in records)} additional source-supported observation(s).")
         return verification
 
     async def _isolated_claim_checkpoint(
@@ -447,13 +904,13 @@ class ReportPipeline:
              f"Isolated-claim review finished (decision: {decision}).")
         return decision
 
-    async def _extract_claims(self, sources: list[Source], on_progress=None) -> list[Claim]:
+    async def _extract_claims(self, sources: list[Source], on_progress=None, audit=None) -> list[Claim]:
         claims: list[Claim] = []
         counter = 0
         # Index claims by normalized text so the same fact from multiple sources
         # merges into ONE claim with multiple candidate sources — that is what
         # makes cross-referencing possible.
-        by_text: dict[str, Claim] = {}
+        by_text: dict[tuple[str, ...], Claim] = {}
         total = len(sources)
 
         # CONCURRENCY: extract from all sources in parallel under a bounded semaphore
@@ -462,24 +919,94 @@ class ReportPipeline:
         # and yields [] so it cannot abort the run. Results stay index-aligned with
         # `sources` so the merge below is byte-for-byte deterministic in source order.
         sem = asyncio.Semaphore(max(1, self._s.llm_max_concurrency))
+        failed = []
+        total_omitted = 0
+        from core_engine.report.passages import extraction_windows, select_research_claims
+
+        cache = getattr(self, "_extraction_cache", None)
+        if cache is None:
+            self._extraction_cache = cache = {}
 
         async def _one(src: Source):
             async with sem:
                 try:
-                    return await self._llm.extract_claims(src.url, src.text)
+                    windows = extraction_windows(src.text, getattr(self, "_research_questions", []),
+                        self._s.llm_context_chars, self._s.extraction_max_chunks_per_source)
+                    structured, table_audit = table_candidates(src, min(4, self._s.extraction_max_claims_per_source))
+                    parts, chunks = ([structured] if structured else []), []
+                    last_error = None
+                    for start, end in windows:
+                        excerpt = src.text[start:end]
+                        focus = tuple(getattr(self, "_research_questions", [])) if src.metadata.get("full_text_accessed") else ()
+                        key = (src.url, excerpt, focus)
+                        try:
+                            reused = key in cache
+                            if not reused:
+                                focused_extractor = getattr(self._llm, "extract_research_claims", None)
+                                cache[key] = (await focused_extractor(src.url, excerpt, list(focus)) if focus and focused_extractor
+                                              else await self._llm.extract_claims(src.url, excerpt))
+                            batch = []
+                            for ex in cache[key]:
+                                position = excerpt.find(ex.source_quote) if ex.source_quote else -1
+                                span = [start, end] if position < 0 else [start + max(0, position - 300),
+                                    min(end, start + position + len(ex.source_quote) + 300)]
+                                batch.append(replace(ex, source_windows={src.url: [span]}))
+                            parts.append(batch)
+                            chunks.append({"start": start, "end": end, "status": "completed", "reused": reused})
+                        except Exception as exc:
+                            last_error = exc
+                            chunks.append({"start": start, "end": end, "status": "error", "error_type": type(exc).__name__,
+                                           "reason": getattr(exc, "reason", "extraction_unavailable")})
+                    if not parts:
+                        raise last_error or ValueError("all_source_chunks_failed")
+                    # Give methods/results/limitations windows a share of the
+                    # claim budget instead of letting the first window fill it.
+                    extracted, seen = [], set()
+                    for index in range(max((len(part) for part in parts), default=0)):
+                        for part in parts:
+                            if index < len(part) and part[index].text not in seen:
+                                seen.add(part[index].text)
+                                extracted.append(part[index])
+                    retained = select_research_claims(extracted,
+                        getattr(self, "_research_questions", []) if src.metadata.get("full_text_accessed") else [],
+                        self._s.extraction_max_claims_per_source)
+                    if audit is not None:
+                        audit.append({"source_url": src.url, "status": "completed", "claim_count": len(retained),
+                                      "budget_omitted": len(extracted) - len(retained), "chunks": chunks,
+                                      "table_extraction": table_audit,
+                                      "source_chars": len(src.text),
+                                      "context_chars_read": sum(c["end"] - c["start"] for c in chunks if c["status"] == "completed")})
+                    return retained
                 except Exception as e:
                     log.warning("extract: source %s failed (%s) — skipping",
                                 src.url, type(e).__name__)
+                    failed.append(src.url)
+                    if audit is not None:
+                        audit.append({"source_url": src.url, "status": "error", "error_type": type(e).__name__,
+                                      "reason": getattr(e, "reason", "extraction_unavailable")})
                     return []
 
         extracted_by_source = await asyncio.gather(*(_one(s) for s in sources))
+        if sources and len(failed) == len(sources):
+            from core_engine.report.llm import LLMResponseError
 
-        for i, (src, extracted) in enumerate(
-                zip(sources, extracted_by_source, strict=True), start=1):
+            raise LLMResponseError("all_source_extractions_failed")
+
+        balanced = [(src, [part[index]]) for index in range(max((len(p) for p in extracted_by_source), default=0))
+                    for src, part in zip(sources, extracted_by_source, strict=True) if index < len(part)]
+        for i, (src, extracted) in enumerate(balanced, start=1):
             for ex in extracted:
-                key = _normalize(ex.text)
+                if not ex.text.strip():
+                    continue
+                key = (_normalize(ex.text), *(normalize_text(getattr(ex, slot) or "")
+                       for slot in ("entity", "attribute", "value", "qualifier", "time_scope")),
+                       json.dumps(ex.metric, sort_keys=True, ensure_ascii=False))
                 if key in by_text:
                     claim = by_text[key]
+                    for url, windows in ex.source_windows.items():
+                        for window in windows:
+                            if window not in claim.source_windows.setdefault(url, []):
+                                claim.source_windows[url].append(window)
                     for u in ex.candidate_source_urls:
                         if u not in claim.candidate_source_urls:
                             claim.candidate_source_urls.append(u)
@@ -493,6 +1020,9 @@ class ReportPipeline:
                         if getattr(claim, slot) is None:
                             setattr(claim, slot, getattr(ex, slot))
                     continue
+                if len(claims) >= self._s.extraction_max_claims:
+                    total_omitted += 1
+                    continue
                 counter += 1
                 claim = Claim(
                     id=f"c{counter}",
@@ -504,18 +1034,23 @@ class ReportPipeline:
                     value=ex.value,
                     qualifier=ex.qualifier,
                     time_scope=ex.time_scope,
+                    metric=ex.metric,
+                    source_windows=ex.source_windows,
                 )
                 by_text[key] = claim
                 claims.append(claim)
             # Per-source progress so the extraction phase shows real movement instead of
             # relying only on the connection heartbeat.
-            if on_progress:
+            if on_progress and (i == len(balanced) or i % max(1, total) == 0):
                 on_progress("extracting_progress",
-                            f"Read {i}/{total} source(s); {len(claims)} claim(s) so far…")
+                            f"Merged {i}/{len(balanced)} observations across {total} source(s); {len(claims)} claim(s)…")
+        if total_omitted and audit is not None:
+            audit.append({"scope": "total_claim_budget", "budget_omitted": total_omitted,
+                          "limit": self._s.extraction_max_claims})
         return claims
 
     async def _assemble(
-        self, topic: str, verification: VerificationReport, sources: list[Source]
+        self, topic: str, verification: VerificationReport, sources: list[Source], *, research_plan=None, focus_claim_ids=None,
     ) -> ReportData:
         """Build the report over the 5 MANDATED sections, KG-driven where required.
 
@@ -527,6 +1062,14 @@ class ReportPipeline:
         """
         verified = verification.verified_claims
         rumors = verification.rumor_claims if self._s.include_rumors_in_report else []
+        if focus_claim_ids is not None:
+            verified = [c for c in verified if c.id in focus_claim_ids]
+            rumors = [c for c in rumors if c.id in focus_claim_ids]
+        focused = bool(research_plan and research_plan.get("requested_metrics") and not re.search(
+            r"industry|sector|supply chain|landscape|行业|产业", topic, re.IGNORECASE))
+        if focused:
+            # A table header alone is context, not a standalone factual finding.
+            verified = [c for c in verified if "|" not in c.text or numeric_tokens(c.text)]
 
         # PERFORMANCE: KG synthesis, the 5 section drafts, and the deep-dive analyses are
         # all independent LLM generations. Running them SEQUENTIALLY was the assembly
@@ -557,14 +1100,20 @@ class ReportPipeline:
         # Locale-aware section plan: the 5 mandated sections plus the synthesis-layer
         # sections (source_comparison / limitations) when enabled.
         plan = self._s.resolved_sections()
+        if focused:
+            buckets = {"findings": verified}
+            plan = [("findings", "主要发现" if self._s.report_locale == "zh" else "Findings")] + [
+                (sid, heading) for sid, heading in plan if sid in _SYNTHESIS_SECTION_IDS]
 
         # 1. KG synthesis + 2. deep-dives + 3. section prose all run in ONE concurrent
         #    batch. KG and deep-dives read verified claims independently; section drafts
         #    are independent per section. All are guarded by the assembly deadline.
         kg_task = asyncio.create_task(
             _guard(build_report_kg(topic, verified, self._llm), None))
-        deep_dives_task = asyncio.create_task(
-            _guard(self._build_deep_dives(topic, verified, buckets), {}))
+        async def _dives():
+            return {} if focused else await self._build_deep_dives(topic, verified, buckets)
+
+        deep_dives_task = asyncio.create_task(_guard(_dives(), {}))
 
         async def _draft(section_id: str, heading: str) -> str:
             bucket = buckets.get(section_id, [])
@@ -573,7 +1122,13 @@ class ReportPipeline:
             # Isolated (single-source, low-credibility) claims carry an explicit
             # marker so the drafting prompt hedges them (workflow E: hedging rules).
             return await self._llm.draft_section(
-                heading, [_claim_line(c) for c in bucket])
+                heading, [f"[[{c.id}]] {_claim_line(c)}" for c in bucket],
+                instructions=f"Write in {'Chinese' if self._s.report_locale == 'zh' else 'English'}. "
+                f"Address the user's task: {topic}. "
+                "Use source assertions only here; interpretations and hypotheses belong in the separate analysis record. "
+                "Describe what the cited sources report, preserving qualifications and test conditions. "
+                "Source rank and absent contradictions do not establish truth or independent replication. "
+                + (f"Research questions: {json.dumps(research_plan.get('questions', []), ensure_ascii=False)}" if research_plan else ""))
 
         draft_tasks = {
             sid: asyncio.create_task(_guard(_draft(sid, heading), ""))
@@ -595,8 +1150,8 @@ class ReportPipeline:
             kg = ReportKnowledgeGraph(topic=topic)
         # Render the standardized chart/table fragments once, from the (possibly empty)
         # KG plus the alignment clusters (comparison matrix).
-        chart_blocks = (charts_mod.build_all(kg, verification.clusters)
-                        if self._s.enable_charts else {})
+        # Rendering waits for sentence grounding and metric/scope validation.
+        chart_blocks = {}
         deep_dives_by_section = await deep_dives_task
         drafted = {sid: await t for sid, t in draft_tasks.items()}
         sc_section = await sc_task if sc_task is not None else None
@@ -623,16 +1178,20 @@ class ReportPipeline:
             paragraphs = [prose] if prose else []
             if not paragraphs and not latex_blocks and not dives:
                 paragraphs = [
-                    ("Insufficient independently verified data was available for this "
-                     "section from authoritative sources.")
+                    ("本节暂无足够的原文支持内容，不能据现有资料补造结论。" if self._s.report_locale == "zh" else
+                     "Insufficient source-supported information was available for this section.")
                 ]
             sections.append(ReportSection(
                 heading=heading, section_id=section_id, paragraphs=paragraphs,
                 claim_ids=[c.id for c in bucket], latex_blocks=latex_blocks,
                 deep_dives=dives,
+                sentences=([ReportSentence(text=paragraphs[0], status="editorial")]
+                           if not prose and not latex_blocks and not dives else []),
             ))
 
         title = _report_title(topic, locale=self._s.report_locale)
+        if focused:
+            title = title.replace("行业简报", "研究简报").replace("Industry Research Report", "Research Report")
         subject = _clean_topic(topic)
         abstract = (
             f"This report synthesizes {len(verified)} verified finding(s) on "
@@ -650,6 +1209,8 @@ class ReportPipeline:
             topic=topic, title=title, abstract=abstract,
             sections=sections, claims=verified, sources=sources, kg=kg,
             rumors=rumors,
+            disputed_claims=[c for c in verification.kept_claims if c.reporting_status == "disputed"],
+            leads=lead_records(verification.rejected_claims),
         )
 
     # keyword routing for the 5 mandated sections
@@ -660,32 +1221,46 @@ class ReportPipeline:
                             "subsidy", "tariff", "compliance", "ministry", "standard"),
         "industry_chain": ("upstream", "midstream", "downstream", "supplies", "supply",
                           "component", "material", "manufactur", "distribut"),
-        "market_size": ("market", "tam", "sam", "som", "cagr", "growth", "billion",
-                       "revenue", "forecast", "size"),
+        "market_size": ("market", "tam", "sam", "som", "cagr", "billion", "revenue"),
         "competitive_landscape": ("competitor", "share", "player", "leader", "rival",
                                  "advantage", "vendor", "incumbent"),
     }
 
     def _bucket_claims(self, verified: list[Claim]) -> dict[str, list[Claim]]:
-        """Assign each verified claim to the best-matching mandated section by keyword
-        score, falling back to round-robin so every claim is placed somewhere."""
+        """Route explicit subject keywords; unmatched technical facts stay in overview."""
         buckets: dict[str, list[Claim]] = {sid: [] for sid, _ in self._s.report_sections}
         section_ids = [sid for sid, _ in self._s.report_sections]
         unassigned: list[Claim] = []
         for claim in verified:
-            low = claim.text.lower()
+            low = normalize_text(claim.text)
             best_id, best_score = "", 0
+            chinese_keywords = {
+                "industry_overview": ("行业", "产业", "技术", "应用", "需求"),
+                "policy_analysis": ("政策", "法规", "补贴", "关税", "监管", "标准"),
+                "industry_chain": ("上游", "中游", "下游", "供应链", "原材料", "制造"),
+                "market_size": ("市场规模", "营收", "亿元", "亿美元", "产值"),
+                "competitive_landscape": ("竞争", "市场份额", "龙头", "竞争优势", "厂商"),
+            }
             for sid, kws in self._SECTION_KEYWORDS.items():
-                score = sum(1 for kw in kws if kw in low)
+                if sid not in buckets:
+                    continue
+                kws = (*kws, *chinese_keywords.get(sid, ()))
+                def matches(keyword, text):
+                    if keyword.isascii():
+                        suffix = r"[a-z]*" if keyword in {"regulat", "manufactur", "distribut"} else ""
+                        return bool(re.search(r"(?<![a-z])" + re.escape(keyword) + suffix + r"(?![a-z])", text))
+                    return keyword in text
+
+                score = sum(1 for kw in kws if matches(kw, low))
                 if score > best_score:
                     best_id, best_score = sid, score
             if best_score > 0:
                 buckets[best_id].append(claim)
             else:
                 unassigned.append(claim)
-        # Round-robin the leftovers so overview/analysis sections aren't starved.
-        for i, claim in enumerate(unassigned):
-            buckets[section_ids[i % len(section_ids)]].append(claim)
+        # Unclassified material stays in overview; never manufacture section relevance.
+        fallback = "industry_overview" if "industry_overview" in buckets else section_ids[0]
+        buckets[fallback].extend(unassigned)
         return buckets
 
     async def _build_deep_dives(
@@ -725,7 +1300,7 @@ class ReportPipeline:
             if not claim_ids:
                 continue
             section_id = cand.section_id if cand.section_id in section_ids else "industry_overview"
-            claim_texts = [text_by_id[cid] for cid in claim_ids]
+            claim_texts = [f"[[{cid}]] {text_by_id[cid]}" for cid in claim_ids]
             specs.append((section_id, cand.title, cand.kind, claim_ids, claim_texts))
             seen_sections_from_insights.add(section_id)
 
@@ -743,7 +1318,7 @@ class ReportPipeline:
                 section_title = dict(self._s.report_sections).get(section_id, section_id)
                 specs.append((
                     section_id, f"{section_title}: Analytical Perspective", "analysis",
-                    [c.id for c in bucket_claims], [c.text for c in bucket_claims],
+                    [c.id for c in bucket_claims], [f"[[{c.id}]] {_claim_line(c)}" for c in bucket_claims],
                 ))
 
         if not specs:
@@ -757,7 +1332,7 @@ class ReportPipeline:
                 log.warning("deep-dive draft failed for %r (%s) — skipping",
                             title, type(e).__name__)
                 return None
-            if len(paragraphs) < self._s.deep_dive_min_paragraphs:
+            if not paragraphs or not parse_draft("\n\n".join(paragraphs)):
                 return None
             return section_id, DeepDive(title=title, kind=kind,
                                         paragraphs=paragraphs, claim_ids=claim_ids)
@@ -786,6 +1361,8 @@ class ReportPipeline:
         lines: list[str] = []
         claim_ids: list[str] = []
         for cluster in clusters:
+            if cluster.get("relation") in {"conflict", "unresolved"}:
+                continue  # deterministic, separately cited disagreement display
             cells: list[str] = []
             isolated = False
             for cell in cluster.get("cells", []):
@@ -804,7 +1381,8 @@ class ReportPipeline:
                     + "; ".join(cells)
                     + f". Relation among sources: "
                       f"{cluster.get('relation') or 'corroborate'}.")
-            lines.append(f"[UNVERIFIED - single source] {line}" if isolated else line)
+            marked = f"[UNVERIFIED - single source] {line}" if isolated else line
+            lines.append(f"[[{','.join(claim_ids)}]] {marked}")
         prose = await self._llm.draft_section(
             heading, lines,
             instructions=(
@@ -812,9 +1390,8 @@ class ReportPipeline:
                 "Attach the reporting source (domain) to EVERY sentence that states a "
                 "figure. For clusters whose relation is 'complement', explain the "
                 "difference in calibre/qualifier (口径) or time scope that reconciles "
-                "the figures. For clusters whose relation is 'conflict', state which "
-                "source prevailed on authority and that the lower-authority figure "
-                "was discarded. Hedge every figure that rests on a single source."
+                "the figures. Never resolve a disagreement by source rank or assert factual truth. "
+                "Attribute every source-reported figure and preserve conditions."
             ))
         return ReportSection(
             heading=heading, section_id="source_comparison",
@@ -854,22 +1431,33 @@ class ReportPipeline:
                         f"{note}".rstrip())
         else:
             paragraphs.append(
-                "所有关键声明均已由多个独立来源交叉验证。" if zh else
-                "All key claims were corroborated by multiple independent sources.")
+                "来源数量与机构权威性不等于独立交叉验证；请查看逐句证据记录。" if zh else
+                "Source count and authority do not establish independent corroboration; inspect sentence citations.")
         if verification.timed_out:
             paragraphs.append(
                 "验证阶段达到时间预算上限，部分声明可能未完成全部交叉核查。" if zh else
                 "Verification reached its time budget; some claims may not have been "
                 "fully cross-checked.")
+        # Internal run statistics are editorial metadata. Isolated factual claims
+        # still go through the same source audit as the main body.
+        metadata = [paragraphs[0], *([paragraphs[-1]] if verification.timed_out else [])]
+        sentences = [ReportSentence(text=p, status="editorial") for p in metadata]
+        for claim in isolated:
+            domain = charts_mod._domain_of(claim.candidate_source_urls[0]) if claim.candidate_source_urls else "unknown"
+            label = claim.credibility.label if claim.credibility is not None else "ungraded"
+            sentences.append(ReportSentence(text=f"{claim.id}: {domain}; {label}.", status="editorial"))
+            sentences.append(ReportSentence(text=f"[UNVERIFIED - single source] {claim.text}",
+                                            claim_ids=[claim.id]))
         return ReportSection(
-            heading=heading, section_id="limitations", paragraphs=paragraphs,
-            claim_ids=[c.id for c in isolated])
+            heading=heading, section_id="limitations", paragraphs=metadata,
+            claim_ids=[c.id for c in isolated], sentences=sentences)
 
     @staticmethod
     def _section_charts(section_id: str, blocks: dict[str, str]) -> list[str]:
         """Pick the pre-rendered chart fragments that belong to a section, dropping
         empties (a fragment is "" when the KG lacked enough verified data)."""
         mapping = {
+            "findings": ["market_callout", "market_plot", "competitive_table", "competitive_bar", "comparison_matrix"],
             "industry_chain": ["chain_tikz"],
             "market_size": ["market_callout", "market_plot"],
             "competitive_landscape": ["competitive_table", "competitive_bar",
@@ -878,11 +1466,44 @@ class ReportPipeline:
         keys = mapping.get(section_id, [])
         return [blocks[k] for k in keys if blocks.get(k)]
 
-    def _out_of_scope(self, result: PipelineResult, reason: str) -> PipelineResult:
+    def _unanswerable(self, result: PipelineResult, sources: list[Source], emit) -> PipelineResult:
+        from uuid import uuid4
+
+        from core_engine.security.files import atomic_write_text
+
+        # A failed draft may have a narrower policy than the research snapshot.
+        # Rebind the refusal artifact to exactly the candidates/proof it exports.
+        candidates = [Claim(**row) for row in result.research_evidence.get("claims", [])]
+        ids = {c.id for c in candidates}
+        candidates += [Claim(row["claim_id"], row["text"], candidate_source_urls=row.get("candidate_source_urls", []))
+                       for row in result.evidence_policy.get("leads", []) if row["claim_id"] not in ids]
+        citations = [SentenceCitation(**row) for row in result.research_evidence.get("citations", [])]
+        if candidates or result.evidence_policy:
+            result.evidence_policy = apply_policy(candidates, sources, citations)
+            result.evidence_policy["leads"] = lead_records(candidates)
+            result.research_evidence["claims"] = [asdict(c) for c in candidates]
         result.status = PipelineStatus.OUT_OF_SCOPE
-        result.message = out_of_scope_message(self._s.report_locale)
-        result.log("scope_gate", ok=False, reason=reason)
-        log.info("out-of-scope for %r: %s", result.topic, reason)
+        missing = ", ".join(result.answerability.get("missing", []))
+        result.message = (
+            f"现有资料无法回答所问问题，缺少有原文支持的指标或时期：{missing}。请补充对应资料。"
+            if self._s.report_locale == "zh" else
+            f"Available sources do not answer the requested question. Missing supported metric/period: {missing}. "
+            "Please provide the corresponding evidence.")
+        self._s.output_dir.mkdir(parents=True, exist_ok=True)
+        path = self._s.output_dir / f"refusal-{uuid4().hex}.evidence.json"
+        atomic_write_text(path, json.dumps({
+            "schema_version": 1, "kind": "insufficient_evidence", "topic": result.topic,
+            "answerability": result.answerability, "sources": [
+                {**asdict(source), "content_sha256": source.content_sha256} for source in sources],
+            "claims": result.research_evidence.get("claims", []), "sections": [],
+            "citations": result.research_evidence.get("citations", []), "metrics": [], "calculations": [],
+            "research_plan": result.research_plan, "research_audit": result.research_audit,
+            "research_evidence": result.research_evidence,
+            "evidence_policy": result.evidence_policy,
+            "leads": result.evidence_policy.get("leads", []),
+        }, ensure_ascii=False, indent=2))
+        result.evidence_path = str(path)
+        emit("out_of_scope", result.message)
         return result
 
 
@@ -928,7 +1549,7 @@ def _distinct_authoritative_domains(sources: list[Source]) -> set[str]:
 
 
 def _normalize(text: str) -> str:
-    return re.sub(r"[^a-z0-9 ]", "", text.lower()).strip()
+    return normalize_text(text)
 
 
 def _min_credibility(a, b):
@@ -1007,6 +1628,9 @@ def _report_title(topic: str, locale: str = "en") -> str:
     command. E.g. 'Generate a report about solar cell' -> 'A Brief Industry
     Research Report of Solar Cell'. Under the zh locale: '<subject>行业简报'."""
     subject = _clean_topic(topic).rstrip(".").strip()
+    explicit_title = re.match(r"(.{2,80}?(?:报告|简报))[:：]", subject)
+    if explicit_title:
+        return explicit_title[1]
     if (locale or "en").lower().startswith("zh"):
         return f"{subject}行业简报" if subject else "行业简报"
     subject = _title_case(subject) if subject else subject

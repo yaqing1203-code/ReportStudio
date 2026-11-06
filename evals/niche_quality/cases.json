@@ -1,0 +1,236 @@
+{
+  "schema_version": 1,
+  "version": "2026-11-03.v1",
+  "captured_at": "2026-11-03",
+  "annotation_method": "A pinned licensed real Crossref abstract excerpt plus one explicitly controlled copy. Baseline extraction units are annotated verbatim; no live reasoning score.",
+  "rubric": {
+    "source_support": "Is each statement supported by the cited passage?",
+    "evidence_limits": "Are abstract-only and single-origin limits explicit?",
+    "scope": "Are laboratory conditions preserved without asserting commercialization?",
+    "question_coverage": "Are requested but unavailable facts withheld?"
+  },
+  "sources": [
+    {
+      "id": "battery-abstract",
+      "url": "https://api.crossref.org/works/10.3390%2Fbatteries8120273",
+      "title": "Improvement of the Electrode–Electrolyte Interface Using Crosslinked Carbonate-Based Copolymers for Solid-State Lithium-Ion Batteries",
+      "published_at": "2022-12-05",
+      "kind": "academic",
+      "document_format": "abstract",
+      "metadata": {
+        "doi": "10.3390/batteries8120273",
+        "title": "Improvement of the Electrode–Electrolyte Interface Using Crosslinked Carbonate-Based Copolymers for Solid-State Lithium-Ion Batteries",
+        "publisher": "MDPI AG",
+        "authors": [
+          "Nantapat Soontornnon",
+          "Yuto Kimata",
+          "Yoichi Tominaga"
+        ],
+        "publication_type": "journal-article",
+        "publication_status": "review_status_unknown",
+        "source_role": "publisher_deposited_abstract",
+        "full_text_accessed": false,
+        "update_metadata_present": false,
+        "retraction_status": "not_determined",
+        "landing_url": "https://doi.org/10.3390/batteries8120273",
+        "licenses": [
+          "https://creativecommons.org/licenses/by/4.0/"
+        ]
+      },
+      "text": "To enhance the stability and capacity of discharge in a solid-state battery system, we created a design that uses the same carbonate-based copolymer for a solid polymer electrolyte (SPE) and a polymer binder in a cathode. The superior thermal resistance behavior and good mechanical properties of the crosslinked carbonate-based copolymer were confirmed and were promising under high temperatures and longer cycles than the original copolymer electrolyte at the same salt concentration of 80 mol%.",
+      "sha256": "c2e303691e18616ab727e3960f034c511b9a0ea74c07268681add81f7ee7f64e",
+      "extractive_units": [
+        "To enhance the stability and capacity of discharge in a solid-state battery system, we created a design that uses the same carbonate-based copolymer for a solid polymer electrolyte (SPE) and a polymer binder in a cathode.",
+        "The superior thermal resistance behavior and good mechanical properties of the crosslinked carbonate-based copolymer were confirmed and were promising under high temperatures and longer cycles than the original copolymer electrolyte at the same salt concentration of 80 mol%."
+      ],
+      "attribution": "Publisher-deposited abstract, Nantapat Soontornnon, Yuto Kimata, Yoichi Tominaga; DOI 10.3390/batteries8120273; CC BY 4.0. Excerpt only, not full text."
+    },
+    {
+      "id": "controlled-copy",
+      "url": "https://fixture.invalid/controlled-copy",
+      "title": "Improvement of the Electrode–Electrolyte Interface Using Crosslinked Carbonate-Based Copolymers for Solid-State Lithium-Ion Batteries",
+      "published_at": "2022-12-05",
+      "kind": "user_provided",
+      "document_format": "abstract",
+      "metadata": {
+        "doi": "10.3390/batteries8120273",
+        "title": "Improvement of the Electrode–Electrolyte Interface Using Crosslinked Carbonate-Based Copolymers for Solid-State Lithium-Ion Batteries",
+        "publisher": "MDPI AG",
+        "authors": [
+          "Nantapat Soontornnon",
+          "Yuto Kimata",
+          "Yoichi Tominaga"
+        ],
+        "publication_type": "journal-article",
+        "publication_status": "review_status_unknown",
+        "source_role": "publisher_deposited_abstract",
+        "full_text_accessed": false,
+        "update_metadata_present": false,
+        "retraction_status": "not_determined",
+        "landing_url": "https://doi.org/10.3390/batteries8120273",
+        "licenses": [
+          "https://creativecommons.org/licenses/by/4.0/"
+        ]
+      },
+      "text": "To enhance the stability and capacity of discharge in a solid-state battery system, we created a design that uses the same carbonate-based copolymer for a solid polymer electrolyte (SPE) and a polymer binder in a cathode. The superior thermal resistance behavior and good mechanical properties of the crosslinked carbonate-based copolymer were confirmed and were promising under high temperatures and longer cycles than the original copolymer electrolyte at the same salt concentration of 80 mol%.",
+      "sha256": "c2e303691e18616ab727e3960f034c511b9a0ea74c07268681add81f7ee7f64e",
+      "extractive_units": [
+        "To enhance the stability and capacity of discharge in a solid-state battery system, we created a design that uses the same carbonate-based copolymer for a solid polymer electrolyte (SPE) and a polymer binder in a cathode.",
+        "The superior thermal resistance behavior and good mechanical properties of the crosslinked carbonate-based copolymer were confirmed and were promising under high temperatures and longer cycles than the original copolymer electrolyte at the same salt concentration of 80 mol%."
+      ],
+      "attribution": "Controlled republication simulation of the same licensed excerpt; this URL is not a real web source."
+    }
+  ],
+  "cases": [
+    {
+      "id": "ssb-single-abstract",
+      "locale": "zh",
+      "question": "概述固态电池的聚合物设计和研究限定。",
+      "source_ids": [
+        "battery-abstract"
+      ],
+      "required_facts": [
+        {
+          "id": "polymer-design",
+          "required_patterns": [
+            "carbonate-based copolymer",
+            "solid polymer electrolyte"
+          ],
+          "numeric_reference": "",
+          "source_ids": [
+            "battery-abstract"
+          ]
+        },
+        {
+          "id": "test-conditions",
+          "required_patterns": [
+            "high temperatures",
+            "80 mol%"
+          ],
+          "numeric_reference": "80 mol%",
+          "source_ids": [
+            "battery-abstract"
+          ]
+        }
+      ],
+      "evidence_thresholds": {
+        "min_authoritative_sources": 2,
+        "min_total_claims": 3,
+        "sparse_evidence_enabled": true
+      },
+      "expected_evidence_mode": "limited_evidence",
+      "expected_origin_groups": 1
+    },
+    {
+      "id": "ssb-conditions",
+      "locale": "zh",
+      "question": "说明固态电池聚合物研究中的盐浓度，并保留比较条件。",
+      "source_ids": [
+        "battery-abstract"
+      ],
+      "required_facts": [
+        {
+          "id": "test-conditions",
+          "required_patterns": [
+            "high temperatures",
+            "80 mol%"
+          ],
+          "numeric_reference": "80 mol%",
+          "source_ids": [
+            "battery-abstract"
+          ]
+        }
+      ],
+      "evidence_thresholds": {
+        "min_authoritative_sources": 2,
+        "min_total_claims": 3,
+        "sparse_evidence_enabled": true
+      },
+      "expected_evidence_mode": "limited_evidence",
+      "expected_origin_groups": 1
+    },
+    {
+      "id": "ssb-republication-is-one-origin",
+      "locale": "zh",
+      "question": "概述固态电池的聚合物设计和研究限定。",
+      "source_ids": [
+        "battery-abstract",
+        "controlled-copy"
+      ],
+      "required_facts": [
+        {
+          "id": "polymer-design",
+          "required_patterns": [
+            "carbonate-based copolymer",
+            "solid polymer electrolyte"
+          ],
+          "numeric_reference": "",
+          "source_ids": [
+            "battery-abstract"
+          ]
+        },
+        {
+          "id": "test-conditions",
+          "required_patterns": [
+            "high temperatures",
+            "80 mol%"
+          ],
+          "numeric_reference": "80 mol%",
+          "source_ids": [
+            "battery-abstract"
+          ]
+        }
+      ],
+      "evidence_thresholds": {
+        "min_authoritative_sources": 2,
+        "min_total_claims": 3,
+        "sparse_evidence_enabled": true
+      },
+      "expected_evidence_mode": "limited_evidence",
+      "expected_origin_groups": 1
+    },
+    {
+      "id": "ssb-no-company-profit",
+      "locale": "zh",
+      "question": "What was Acme's net profit in 2025?",
+      "source_ids": [
+        "battery-abstract"
+      ],
+      "required_facts": [],
+      "expected_abstention": true,
+      "evidence_thresholds": {
+        "min_authoritative_sources": 2,
+        "min_total_claims": 3
+      }
+    },
+    {
+      "id": "ssb-lab-not-production",
+      "locale": "zh",
+      "question": "确定该固态电池技术2026年的量产情况。",
+      "source_ids": [
+        "battery-abstract"
+      ],
+      "required_facts": [],
+      "expected_abstention": true,
+      "evidence_thresholds": {
+        "min_authoritative_sources": 2,
+        "min_total_claims": 3
+      }
+    },
+    {
+      "id": "ssb-strict-thresholds-opt-out",
+      "locale": "zh",
+      "question": "概述固态电池的聚合物设计和研究限定。",
+      "source_ids": [
+        "battery-abstract"
+      ],
+      "required_facts": [],
+      "expected_abstention": true,
+      "evidence_thresholds": {
+        "min_authoritative_sources": 2,
+        "min_total_claims": 3,
+        "sparse_evidence_enabled": false
+      }
+    }
+  ]
+}

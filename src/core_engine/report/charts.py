@@ -18,17 +18,24 @@ render a graceful "insufficient verified data" note instead of a broken figure.
 """
 from __future__ import annotations
 
+from decimal import Decimal
 from urllib.parse import urlparse
 
 from core_engine.report.kg import ChainTier, ReportKnowledgeGraph
 from core_engine.report.latex import tex_escape
 
 
-def _fmt(value: float) -> str:
-    """Format a number for LaTeX: drop the trailing .0 on integers."""
-    if value == int(value):
-        return str(int(value))
-    return f"{value:.2f}".rstrip("0").rstrip(".")
+def _fmt(value: Decimal | float | None) -> str:
+    """Preserve source precision; never silently round a small plotted value to zero."""
+    number = Decimal(str(value))
+    if not number.is_finite():
+        raise ValueError("Charts cannot contain NaN or infinity")
+    text = format(number, "f")
+    return text.rstrip("0").rstrip(".") if "." in text else text
+
+
+def _approved(kg: ReportKnowledgeGraph, block: str) -> bool:
+    return kg.numeric_validated and block in kg.validated_blocks
 
 
 # --------------------------------------------------------------------------
@@ -37,7 +44,7 @@ def _fmt(value: float) -> str:
 def industry_chain_tikz(kg: ReportKnowledgeGraph) -> str:
     """A three-column TikZ flowchart: upstream | midstream | downstream, with the
     extracted supply edges drawn between named nodes."""
-    if not kg.has_chain():
+    if not _approved(kg, "chain_tikz") or not kg.has_chain():
         return ""
 
     tiers = [
@@ -84,11 +91,7 @@ def industry_chain_tikz(kg: ReportKnowledgeGraph) -> str:
         if sid and did:
             lines.append(rf"\draw[supply] ({sid}) -- ({did});")
 
-    # If no explicit edges survived, draw tier-to-tier guide arrows so the flow reads.
-    if not any(node_id.get(e.src.lower()) and node_id.get(e.dst.lower())
-               for e in kg.chain_edges):
-        lines.append(r"\draw[supply, dashed] (head-upstream) -- (head-midstream);")
-        lines.append(r"\draw[supply, dashed] (head-midstream) -- (head-downstream);")
+    # Unknown supply relationships stay absent; layout never invents guide edges.
 
     lines.append(r"\end{tikzpicture}")
     return "\n".join(lines)
@@ -101,7 +104,7 @@ def market_size_plot(kg: ReportKnowledgeGraph) -> str:
     """A pgfplots line chart of the historical market-size series. Returns "" if we
     don't have at least two verified data points to plot."""
     m = kg.market
-    if not m.has_chartable_series():
+    if not _approved(kg, "market_plot") or not m.has_chartable_series():
         return ""
 
     coords = " ".join(f"({d.year},{_fmt(d.value)})" for d in m.series)
@@ -111,6 +114,7 @@ def market_size_plot(kg: ReportKnowledgeGraph) -> str:
         r"\begin{axis}[",
         r"    width=0.9\textwidth, height=6cm,",
         r"    xlabel={Year}, ylabel={Market size (" + unit + r")},",
+        r"    ymin=0,",
         r"    xtick=data, tick label style={font=\small},",
         r"    grid=major, grid style={accent!25},",
         r"    every axis plot/.append style={primary, thick, mark=*},",
@@ -127,28 +131,26 @@ def market_size_callout(kg: ReportKnowledgeGraph) -> str:
     """A small booktabs table of the TAM/SAM/SOM headline figures + CAGR. Returns ""
     if none of the headline figures were verified."""
     m = kg.market
-    rows: list[tuple[str, float | None]] = [
+    rows: list[tuple[str, Decimal | float | None]] = [
         ("TAM (Total Addressable Market)", m.tam),
         ("SAM (Serviceable Addressable Market)", m.sam),
         ("SOM (Serviceable Obtainable Market)", m.som),
     ]
     present = [(label, v) for label, v in rows if v is not None]
-    if not present and m.cagr_pct is None:
+    if not _approved(kg, "market_callout") or not present:
         return ""
 
     unit = tex_escape(m.unit)
     # Content-only (no float env): the template wraps every block in a figure[H],
     # and a `table` float nested inside a figure float is a LaTeX error.
     out = [
-        r"\begin{tabular}{@{}lr@{}}",
+        r"\begin{tabular}{@{}lrrl@{}}",
         r"\toprule",
-        r"\textbf{Metric} & \textbf{Value (" + unit + r")} \\",
+        r"\textbf{Metric} & \textbf{Value} & \textbf{Unit} & \textbf{Period} \\",
         r"\midrule",
     ]
     for label, v in present:
-        out.append(rf"{tex_escape(label)} & {_fmt(v)} \\")
-    if m.cagr_pct is not None:
-        out.append(rf"CAGR & {_fmt(m.cagr_pct)}\% \\")
+        out.append(rf"{tex_escape(label)} & {_fmt(v)} & {unit} & {tex_escape(m.period or '')} \\")
     out += [r"\bottomrule", r"\end{tabular}"]
     return "\n".join(out)
 
@@ -158,7 +160,7 @@ def market_size_callout(kg: ReportKnowledgeGraph) -> str:
 # --------------------------------------------------------------------------
 def competitive_table(kg: ReportKnowledgeGraph) -> str:
     """A booktabs table of players, market share, and competitive advantage."""
-    if not kg.has_competitors():
+    if not _approved(kg, "competitive_table") or not kg.has_competitors():
         return ""
     # Content-only (no float env): the template wraps this in a figure[H]. Uses a
     # tabularx-free fixed-width layout that wraps long advantage text across lines so
@@ -185,18 +187,20 @@ def competitive_table(kg: ReportKnowledgeGraph) -> str:
 def competitive_share_bar(kg: ReportKnowledgeGraph) -> str:
     """A pgfplots horizontal bar chart of market share. Returns "" if fewer than two
     competitors have a known share."""
+    if not _approved(kg, "competitive_bar"):
+        return ""
     withshare = [c for c in kg.competitors if c.market_share_pct is not None]
     if len(withshare) < 2:
         return ""
     withshare.sort(key=lambda c: -(c.market_share_pct or 0))
-    names = ",".join(tex_escape(c.name) for c in withshare)
+    names = ",".join("{" + tex_escape(c.name) + "}" for c in withshare)
     coords = " ".join(f"({_fmt(c.market_share_pct)},{i})"
                       for i, c in enumerate(withshare))
     lines = [
         r"\begin{tikzpicture}",
         r"\begin{axis}[",
-        r"    width=0.9\textwidth, height=" + _fmt(1.2 + 0.6 * len(withshare)) + r"cm,",
-        r"    xbar, xmin=0,",
+        r"    width=0.9\textwidth, height=" + _fmt(Decimal("1.2") + Decimal("0.6") * len(withshare)) + r"cm,",
+        r"    xbar, xmin=0, xmax=100,",
         r"    xlabel={Market share (\%)},",
         r"    ytick={" + ",".join(str(i) for i in range(len(withshare))) + r"},",
         r"    yticklabels={" + names + r"},",
@@ -223,7 +227,7 @@ def build_all(kg: ReportKnowledgeGraph, clusters: list[dict] | None = None) -> d
         "market_callout": market_size_callout(kg),
         "competitive_table": competitive_table(kg),
         "competitive_bar": competitive_share_bar(kg),
-        "comparison_matrix": comparison_matrix(clusters or []),
+        "comparison_matrix": comparison_matrix(clusters or []) if _approved(kg, "comparison_matrix") else "",
     }
 
 
@@ -250,12 +254,13 @@ def comparison_matrix(clusters: list[dict]) -> str:
     if not clusters:
         return ""
 
-    # Columns = distinct (domain, qualifier) pairs, in first-seen order.
-    columns: list[tuple[str, str]] = []
+    # Preserve source URL and period: two reports from one domain or two years
+    # must never silently overwrite each other's values.
+    columns: list[tuple[str, str, str]] = []
     for cluster in clusters:
         for cell in cluster.get("cells", []):
-            key = (_domain_of(str(cell.get("source_url") or "")),
-                   str(cell.get("qualifier") or ""))
+            key = (str(cell.get("source_url") or ""),
+                   str(cell.get("qualifier") or ""), str(cell.get("time_scope") or ""))
             if key not in columns:
                 columns.append(key)
     if not columns:
@@ -275,13 +280,14 @@ def comparison_matrix(clusters: list[dict]) -> str:
             if value is None or str(value).strip() == "":
                 continue
             any_value = True
-            key = (_domain_of(str(cell.get("source_url") or "")),
-                   str(cell.get("qualifier") or ""))
+            key = (str(cell.get("source_url") or ""),
+                   str(cell.get("qualifier") or ""), str(cell.get("time_scope") or ""))
             text = tex_escape(str(value))
             if cell.get("credibility") == 4:
                 text += r"\(^\dagger\)"
                 has_dagger = True
-            cells[col_index[key]] = text
+            index = col_index[key]
+            cells[index] = cells[index] + " / " + text if cells[index] and text != cells[index] else text
         rows.append((entity, attribute, cells, has_dagger))
         any_dagger = any_dagger or has_dagger
     if not any_value:
@@ -292,17 +298,19 @@ def comparison_matrix(clusters: list[dict]) -> str:
     colspec = (r"@{}p{0.16\textwidth}p{0.14\textwidth}"
                + rf"p{{{val_w:.2f}\textwidth}}" * ncols + r"@{}")
 
-    def _col_head(domain: str, qualifier: str) -> str:
-        head = tex_escape(domain)
+    def _col_head(url: str, qualifier: str, period: str) -> str:
+        head = tex_escape(_domain_of(url))
         if qualifier:
             head += rf" ({tex_escape(qualifier)})"
+        if period:
+            head += rf" [{tex_escape(period)}]"
         return rf"\textbf{{{head}}}"
 
     out = [
         r"\begin{tabular}{" + colspec + "}",
         r"\toprule",
         r"\textbf{Entity} & \textbf{Attribute} & "
-        + " & ".join(_col_head(d, q) for d, q in columns) + r" \\",
+        + " & ".join(_col_head(url, q, p) for url, q, p in columns) + r" \\",
         r"\midrule",
     ]
     for entity, attribute, cells, _has_dagger in rows:

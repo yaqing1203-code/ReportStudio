@@ -41,6 +41,8 @@ async def _run(topic: str, *, no_pdf: bool, show_trace: bool) -> int:
         print(f"tex    : {result.tex_path}")
     if result.pdf_path:
         print(f"pdf    : {result.pdf_path}")
+    if result.evidence_path:
+        print(f"evidence: {result.evidence_path}")
 
     if show_trace:
         print("\n--- trace ---")

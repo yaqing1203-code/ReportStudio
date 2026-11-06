@@ -24,8 +24,12 @@ import os
 import sys
 from datetime import UTC
 from pathlib import Path
+from threading import RLock
+
+from core_engine.security.files import atomic_write_text, storage_path
 
 APP_DIR_NAME = "CoreEngineReports"
+_STORE_LOCK = RLock()
 
 # Fields the GUI is allowed to set, mapped to the CE_ env var the config reads.
 # Keeping this explicit (rather than accepting arbitrary keys) means the frontend
@@ -40,6 +44,8 @@ _SETTINGS_TO_ENV = {
     "search_api_key": "CE_SEARCH_API_KEY",
     "firecrawl_api_key": "CE_FIRECRAWL_API_KEY",
     "jina_api_key": "CE_JINA_API_KEY",
+    "openalex_api_key": "CE_OPENALEX_API_KEY",
+    "openalex_search_enabled": "CE_OPENALEX_SEARCH_ENABLED",
     "search_router_enabled": "CE_SEARCH_ROUTER_ENABLED",
     "verify_mode": "CE_VERIFY_MODE",
     "latex_engine": "CE_LATEX_ENGINE",
@@ -49,7 +55,7 @@ _SETTINGS_TO_ENV = {
 # Keys we treat as secret: never returned to the frontend in cleartext, stored in a
 # user-only file. The GUI shows whether a key is SET, not the value itself.
 _SECRET_KEYS = {"llm_api_key", "anthropic_api_key", "search_api_key",
-                "firecrawl_api_key", "jina_api_key"}
+                "firecrawl_api_key", "jina_api_key", "openalex_api_key"}
 
 
 def is_frozen() -> bool:
@@ -117,36 +123,47 @@ def store_pdf(report_id: str, source_pdf: Path, topic: str = "") -> Path:
     import shutil
 
     source_pdf = Path(source_pdf)
-    dest = generated_pdfs_dir() / f"{report_id}.pdf"
+    dest = storage_path(generated_pdfs_dir(), report_id, ".pdf")
     if source_pdf.resolve() != dest.resolve():
         shutil.copyfile(source_pdf, dest)
-    index = _load_pdf_index()
-    index[report_id] = {
-        "pdf": str(dest),
-        "topic": topic,
-        "created": _now_iso(),
-    }
-    _pdf_index_path().write_text(json.dumps(index, indent=2), encoding="utf-8")
+    with _STORE_LOCK:
+        index = _load_pdf_index()
+        index[report_id] = {
+            "pdf": str(dest), "topic": topic, "created": _now_iso(),
+        }
+        atomic_write_text(_pdf_index_path(), json.dumps(index, indent=2))
     return dest
 
 
 def lookup_pdf(report_id: str) -> Path | None:
     """Return the stored PDF path for a report id if it exists on disk, else None.
-    Checks the index first, then falls back to the conventional <id>.pdf filename."""
-    index = _load_pdf_index()
-    entry = index.get(report_id)
-    if entry:
-        p = Path(entry["pdf"])
-        if p.exists():
-            return p
-    # Fallback: the file may exist even if the index was lost.
-    cand = generated_pdfs_dir() / f"{report_id}.pdf"
-    return cand if cand.exists() else None
+    Only the conventional <id>.pdf path is served; index metadata is not a path
+    authority and cannot redirect a download to another local file."""
+    try:
+        cand = storage_path(generated_pdfs_dir(), report_id, ".pdf")
+    except ValueError:
+        return None
+    return cand if cand.is_file() else None
 
 
 def _now_iso() -> str:
     from datetime import datetime
     return datetime.now(UTC).isoformat()
+
+
+def store_evidence(report_id: str, source: Path) -> Path:
+    dest = storage_path(generated_pdfs_dir(), report_id, ".evidence.json")
+    if Path(source).resolve() != dest:
+        atomic_write_text(dest, Path(source).read_text(encoding="utf-8"))
+    return dest
+
+
+def lookup_evidence(report_id: str) -> Path | None:
+    try:
+        dest = storage_path(generated_pdfs_dir(), report_id, ".evidence.json")
+    except ValueError:
+        return None
+    return dest if dest.is_file() else None
 
 
 def bundled_resource(rel: str) -> Path:
@@ -190,6 +207,12 @@ def redacted_settings() -> dict:
 
 
 def save_settings(update: dict) -> dict:
+    """Atomically merge settings, apply them, and return only redacted values."""
+    with _STORE_LOCK:
+        return _save_settings(update)
+
+
+def _save_settings(update: dict) -> dict:
     """Merge + persist GUI settings, then apply them to the environment so the next
     get_settings() sees them. Only whitelisted keys are accepted. A secret sent as an
     empty string is treated as 'leave unchanged' (the UI sends '' when the user didn't
@@ -198,6 +221,9 @@ def save_settings(update: dict) -> dict:
     Returns the redacted settings for the UI.
     """
     current = load_settings()
+    engine = update.get("latex_engine")
+    if engine is not None and engine not in {"auto", "tectonic", "xelatex", "pdflatex", "latexmk"}:
+        raise ValueError("Unsupported LaTeX engine")
     for key, value in update.items():
         if key not in _SETTINGS_TO_ENV:
             continue  # ignore unknown keys — the frontend cannot set arbitrary config
@@ -209,8 +235,13 @@ def save_settings(update: dict) -> dict:
             current[key] = value
 
     p = _settings_path()
-    p.write_text(json.dumps(current, indent=2), encoding="utf-8")
+    atomic_write_text(p, json.dumps(current, indent=2))
     _restrict_permissions(p)
+    # Explicit null clears both persistence AND the already-applied environment.
+    # Leave env-only settings alone when loading settings at startup.
+    for key, value in update.items():
+        if key in _SETTINGS_TO_ENV and value is None:
+            os.environ.pop(_SETTINGS_TO_ENV[key], None)
     apply_settings_to_env(current)
     return redacted_settings()
 

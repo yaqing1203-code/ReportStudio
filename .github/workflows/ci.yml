@@ -6,10 +6,11 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
+        os: [ubuntu-latest, windows-latest]
         python-version: ["3.11", "3.14"]
     steps:
       - uses: actions/checkout@v4
@@ -31,3 +32,19 @@ jobs:
 
       - name: Pytest
         run: pytest tests/ -q
+
+      - name: Validate report-quality source snapshots
+        run: python -m core_engine.report.quality_eval --mode check
+
+      - name: Deterministic report-quality regression
+        run: python -m core_engine.report.quality_eval --mode baseline --output output/quality-ci.json
+
+      - name: Bounded research and inference regression
+        run: python -m core_engine.report.research_eval --output output/research-quality-ci.json
+
+      - name: Solid-state battery sparse-evidence regression
+        run: python -m core_engine.report.quality_eval --mode baseline --dataset evals/niche_quality/cases.json --output output/quality-niche-ci.json
+
+      - name: Dependency audit
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.11'
+        run: pip-audit --local

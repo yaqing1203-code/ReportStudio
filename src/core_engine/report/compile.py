@@ -29,7 +29,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-from core_engine.config import get_settings
+from core_engine.config import Settings, get_settings
 
 log = logging.getLogger(__name__)
 
@@ -52,6 +52,8 @@ def _bundled_dir() -> Path | None:
 def _resolve(engine: str) -> str | None:
     """Return the absolute path to `engine`, checking the bundled bin/ dir first
     (so the packaged Tectonic wins) then the system PATH. None if not found."""
+    if engine not in _ENGINE_PREFERENCE:
+        raise CompileError("Unsupported LaTeX engine; choose auto, tectonic, xelatex, pdflatex or latexmk.")
     bundled = _bundled_dir()
     if bundled:
         for name in (engine, f"{engine}.exe"):
@@ -96,31 +98,31 @@ def _build_cmd(cmd_path: str, work_tex: Path, out_dir: Path) -> tuple[list[str],
         # Tectonic: keep it hermetic and quiet; it fetches+caches packages itself.
         # Note: --synctex option removed for compatibility with Tectonic 0.16.x
         return (
-            [cmd_path, "--outdir", str(out_dir), "--keep-logs", str(work_tex)],
+            [cmd_path, "--untrusted", "--outdir", str(out_dir), "--keep-logs", work_tex.name],
             1,
         )
     if Path(cmd_path).name.lower().startswith("latexmk"):
-        return ([cmd_path, "-xelatex", "-interaction=nonstopmode", "-halt-on-error",
-                 f"-outdir={out_dir}", str(work_tex)], 1)
+        return ([cmd_path, "-norc", "-no-shell-escape", "-xelatex", "-interaction=nonstopmode", "-halt-on-error",
+                 f"-outdir={out_dir}", work_tex.name], 1)
     # xelatex / pdflatex
     return (
-        [cmd_path, "-interaction=nonstopmode", "-halt-on-error",
-         f"-output-directory={out_dir}", str(work_tex)],
+        [cmd_path, "-no-shell-escape", "-interaction=nonstopmode", "-halt-on-error",
+         f"-output-directory={out_dir}", work_tex.name],
         2,
     )
 
 
-def compile_pdf(tex_path: Path, *, engine: str | None = None) -> Path:
+def compile_pdf(tex_path: Path, *, engine: str | None = None, settings: Settings | None = None) -> Path:
     """Compile a .tex file to PDF next to it. Returns the PDF path.
 
     Raises CompileError with actionable detail on any failure.
     """
-    s = get_settings()
+    s = settings or get_settings()
     tex_path = Path(tex_path)
     if not tex_path.exists():
         raise CompileError(f"tex file not found: {tex_path}")
 
-    cmd_path = available_engine(engine)
+    cmd_path = available_engine(engine or s.latex_engine)
     if not cmd_path:
         raise CompileError(
             "No LaTeX engine available. The packaged app ships Tectonic; if you are "
@@ -138,6 +140,9 @@ def compile_pdf(tex_path: Path, *, engine: str | None = None) -> Path:
         # first compile pays the fetch cost once and later ones are offline+fast.
         env = dict(os.environ)
         env.setdefault("TECTONIC_CACHE_DIR", str(s.output_dir / ".tectonic-cache"))
+        env["TECTONIC_UNTRUSTED_MODE"] = "1"
+        env["openin_any"] = "p"
+        env["openout_any"] = "p"
 
         last_log = ""
         for i in range(passes):

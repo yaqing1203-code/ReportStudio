@@ -12,7 +12,6 @@ import pytest
 
 from core_engine.report.latex import render_tex, tex_escape
 from core_engine.report.models import (
-    OUT_OF_SCOPE_MESSAGE,
     Claim,
     PipelineStatus,
     ReportData,
@@ -193,7 +192,7 @@ async def test_authority_fast_path_short_circuits_cross_referencing(cross_ref, m
         async def check_traceability(self, claim, source_text):
             self.checks += 1
             return TraceJudgement(supported=True, hallucinated=False,
-                                  evidence_span="q", confidence=1.0)
+                                  evidence_span=shared, confidence=1.0)
 
     get_settings.cache_clear()
     monkeypatch.setenv("CE_VERIFY_FAST_PATH_HIGH_TRUST", "true")
@@ -251,8 +250,8 @@ async def test_harness_drops_only_hallucinations(cross_ref, monkeypatch):
     bad = Claim(id="c2", text="a fabricated finding",
                 candidate_source_urls=["https://someblog.net/b"])
     sources = [
-        Source("https://someblog.net/a", "someblog.net", "A", SourceKind.GENERAL_WEB, text="x"),
-        Source("https://someblog.net/b", "someblog.net", "B", SourceKind.GENERAL_WEB, text="x"),
+        Source("https://someblog.net/a", "someblog.net", "A", SourceKind.GENERAL_WEB, text="ok"),
+        Source("https://someblog.net/b", "someblog.net", "B", SourceKind.GENERAL_WEB, text="ok"),
     ]
     try:
         report = await VerificationHarness(StubLLM()).verify([good, bad], sources)
@@ -297,10 +296,8 @@ def conflict_only(monkeypatch):
     get_settings.cache_clear()
 
 
-async def test_conflict_only_accepts_all_without_source_checks(conflict_only):
-    """conflict_only accepts every extracted claim as fact and never calls the
-    per-claim entailment/traceability oracle — proving the expensive step is bypassed."""
-    from core_engine.report.models import ConfidenceTier
+async def test_conflict_only_retains_candidates_without_fake_source_support(conflict_only):
+    """Pair review retains candidates; the pipeline's mandatory source gate binds them."""
 
     class NoVerifyLLM:
         """Fails loudly if any per-claim verification is attempted; contradiction
@@ -331,17 +328,16 @@ async def test_conflict_only_accepts_all_without_source_checks(conflict_only):
     # Both accepted as fact; nothing rejected; both reportable.
     assert report.kept_count == 2
     assert report.rejected_claims == []
-    assert report.verified_count == 2                       # HIGH/LIKELY are reportable
+    assert report.verified_count == 0
     # Different subjects -> no candidate pair -> not even a contradiction call.
     assert llm.contradiction_checks == 0
     # High-trust provenance -> HIGH tier, and citations still resolve to real URLs.
-    assert {c.confidence for c in report.kept_claims} == {ConfidenceTier.HIGH}
-    assert report.kept_claims[0].supporting_sources() == ["https://cdc.gov/p"]
+    assert all(c.confidence is None and not c.verified for c in report.kept_claims)
+    assert report.kept_claims[0].supporting_sources() == []
 
 
-async def test_conflict_only_drops_lower_authority_of_conflicting_pair(conflict_only):
-    """Two same-subject claims with diverging numbers contradict; the one backed by the
-    lower-authority source is dropped, the higher-authority one kept."""
+async def test_conflict_only_retains_both_sides_of_conflicting_pair(conflict_only):
+    """Source rank is not sufficient to resolve a same-condition disagreement."""
     shared_subject = "The national unemployment rate for 2024"
     gov = Source("https://bls.gov/a", "bls.gov", "BLS", SourceKind.GOVERNMENT, text="x")
     blog = Source("https://someblog.net/b", "someblog.net", "Blog",
@@ -354,9 +350,9 @@ async def test_conflict_only_drops_lower_authority_of_conflicting_pair(conflict_
     from core_engine.report.llm import FakeLLM
     report = await VerificationHarness(FakeLLM()).verify([lo, hi], [gov, blog])
     kept_ids = {c.id for c in report.kept_claims}
-    assert kept_ids == {"gov1"}
+    assert kept_ids == {"gov1", "blog1"}
     assert "blog1" in report.reasons
-    assert "contradicted" in report.reasons["blog1"]
+    assert "unresolved conflict" in report.reasons["blog1"]
 
 
 async def test_conflict_only_keeps_nonconflicting_claim_untouched(conflict_only):
@@ -394,7 +390,8 @@ def test_report_renders_rumors_section_separately():
     )
     tex = render_tex(report)
     assert "Unverified Signals" in tex
-    assert "new widget plant may open" in tex
+    # A raw rumor without an audited source span is not published by the renderer.
+    assert "new widget plant may open" not in tex
     assert "unverified" in tex.lower()
 
 
@@ -436,7 +433,7 @@ def _authoritative_fixture():
     """Build a search provider + fetcher where 3 gov domains all state the same
     5 verifiable facts, so claims clear triple-check AND cross-reference."""
     facts = (
-        "The initiative launched in 2021."
+        "The clean energy initiative launched in 2021."
         " It allocated 5 billion dollars in funding."
         " Participation increased by 30 percent in 2022."
         " The program operated in 12 regions."
@@ -464,7 +461,8 @@ async def test_pipeline_out_of_scope_when_no_authoritative_sources():
     pipe = ReportPipeline(llm=FakeLLM(), search=search, fetcher=fetcher)
     result = await pipe.run("obscure niche topic", compile_to_pdf=False)
     assert result.status is PipelineStatus.OUT_OF_SCOPE
-    assert result.message == OUT_OF_SCOPE_MESSAGE
+    assert "authoritative_sources" in result.message
+    assert result.evidence_path
     assert result.pdf_path is None
 
 
@@ -742,8 +740,7 @@ async def test_traceable_mode_accepts_paraphrase_rejects_hallucination(cross_ref
             if "fabricated" in claim:
                 if "flagme" in source_text:
                     return TraceJudgement(supported=False, hallucinated=True)
-                return TraceJudgement(supported=True, hallucinated=False,
-                                      evidence_span="ok", confidence=0.9)
+                return TraceJudgement(supported=False, hallucinated=False)
             return TraceJudgement(supported=True, hallucinated=False,
                                   evidence_span="ok", confidence=0.9)
 
@@ -754,8 +751,8 @@ async def test_traceable_mode_accepts_paraphrase_rejects_hallucination(cross_ref
     bad = Claim(id="c2", text="a fabricated finding",
                 candidate_source_urls=["https://cdc.gov/a", "https://iea.org/flagme"])
     sources = [
-        Source("https://cdc.gov/a", "cdc.gov", "A", SourceKind.GOVERNMENT, text="..."),
-        Source("https://iea.org/b", "iea.org", "B", SourceKind.INDUSTRY_INSTITUTION, text="..."),
+        Source("https://cdc.gov/a", "cdc.gov", "A", SourceKind.GOVERNMENT, text="ok"),
+        Source("https://iea.org/b", "iea.org", "B", SourceKind.INDUSTRY_INSTITUTION, text="ok"),
         Source("https://iea.org/flagme", "iea.org", "F", SourceKind.INDUSTRY_INSTITUTION,
                text="flagme"),
     ]
@@ -808,10 +805,8 @@ async def test_kg_build_and_charts_from_verified_claims():
     assert len(kg.competitors) == 2
 
     blocks = build_all(kg)
-    assert "tikzpicture" in blocks["chain_tikz"]
-    assert "axis" in blocks["market_plot"]
-    assert "tabular" in blocks["competitive_table"]
-    assert "xbar" in blocks["competitive_bar"]
+    # LLM proposals cannot render until their numeric and scope audit has run.
+    assert all(block == "" for block in blocks.values())
 
 
 def test_kg_drops_elements_without_verified_provenance():
@@ -872,7 +867,7 @@ def _industry_fixture():
     """3 authoritative domains (gov + IB + institution) stating the same industry
     facts, including chain/market/competitor markers the FakeLLM KG extractor reads."""
     facts = (
-        "The solar sector background shows strong adoption."
+        "In 2021 solar power adoption increased."
         " Government policy introduced a subsidy in 2021."
         " UPSTREAM: Polysilicon is a key input."
         " MIDSTREAM: Cell Manufacturing integrates components."

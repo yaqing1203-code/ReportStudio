@@ -1,0 +1,62 @@
+{
+  "objective": "固态电池",
+  "questions": [
+    {
+      "id": "q1",
+      "question": "固态电池",
+      "kind": "fact",
+      "required": true,
+      "evidence_needed": "提供标明主体、时期、统计口径和观测值的原文摘录。"
+    },
+    {
+      "id": "q2",
+      "question": "“固态电池”的核心技术路线包括哪些，各路线在电解质形态、界面阻抗、离子电导率和制造工艺上有何差异？",
+      "kind": "comparison",
+      "required": false,
+      "evidence_needed": "明确区分全固态、准固态和半固态电池，并查找不同电解质路线（硫化物、氧化物、聚合物等）的可比技术指标与实验条件。"
+    },
+    {
+      "id": "q3",
+      "question": "全固态电池相较于液态锂电池的主要优势是什么，这些优势在哪些能量密度、倍率、循环寿命和安全性指标上得到实验验证？",
+      "kind": "fact",
+      "required": false,
+      "evidence_needed": "需要同一测试条件下的基准电池、测试协议、指标定义和完整电芯数据，避免仅依据材料级或半电池结果。"
+    },
+    {
+      "id": "q4",
+      "question": "当前全固态电池商业化的主要瓶颈是什么，制造良率、固固界面、锂金属沉积与枝晶、压力管理等问题的相互影响如何？",
+      "kind": "explanation",
+      "required": false,
+      "evidence_needed": "需要失效分析、机理研究、规模化制造数据和产业化时间表，并区分实验室样品、试生产线与量产电芯。"
+    },
+    {
+      "id": "q5",
+      "question": "硫化物与氧化物固态电解质路线各自面临哪些可能否定其规模化优势的挑战？",
+      "kind": "counterevidence",
+      "required": false,
+      "evidence_needed": "重点寻找反例和限制条件，包括硫化氢与湿度反应、氧化物烧结、界面副反应、导电剂及高面倍率下的性能衰减。"
+    },
+    {
+      "id": "q6",
+      "question": "如何评价不同公开的全固态电池能量密度和循环寿命数据，避免因测试条件、液态残留及电极定义不同造成误导？",
+      "kind": "risk",
+      "required": false,
+      "evidence_needed": "需要核对电芯化学体系、正负极容量、是否含液态或凝胶电解质、测试温度、截止电压、倍率、压力条件和数据来源。"
+    }
+  ],
+  "requested_metrics": [],
+  "requested_entities": [],
+  "requested_periods": [],
+  "method": "validated_model_proposal",
+  "notes": [],
+  "search_terms": [
+    "全固态电池 硫化物 氧化物 聚合物 电解质 离子电导率 界面阻抗 制造工艺 对比",
+    "全固态电池 能量密度 循环寿命 压力 液态残留 固态含量 测试条件",
+    "all-solid-state vs semi-solid battery electrolyte interface dendrite manufacturing scale-up comparison"
+  ],
+  "initial_queries": [
+    "固态电池",
+    "“固态电池”的核心技术路线包括哪些，各路线在电解质形态、界面阻抗、离子电导率和制造工艺上有何差异？",
+    "全固态电池相较于液态锂电池的主要优势是什么，这些优势在哪些能量密度、倍率、循环寿命和安全性指标上得到实验验证？"
+  ]
+}

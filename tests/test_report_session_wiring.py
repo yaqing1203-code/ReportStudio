@@ -27,7 +27,11 @@ def client(monkeypatch, tmp_path):
 
     from core_engine.app.server import create_app
 
-    return TestClient(create_app())
+    try:
+        with TestClient(create_app(), base_url="http://127.0.0.1") as client:
+            yield client
+    finally:
+        get_settings.cache_clear()
 
 
 def test_report_message_creates_session_and_history(client):

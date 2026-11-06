@@ -1,6 +1,6 @@
 [project]
 name = "core-engine"
-version = "0.2.0"
+version = "0.3.0"
 description = "Automated report-generation agent: topic -> authoritative-source scraping -> triple-check verification harness -> formal LaTeX/PDF report."
 requires-python = ">=3.11"
 dependencies = [
@@ -55,6 +55,8 @@ dev = [
     "anyio>=4.0",                  # async test plugin (pytest.mark.anyio)
     "ruff>=0.5",
     "mypy>=1.10",
+    "jsonschema>=4.21",            # gateway contract tests import this dormant layer
+    "pip-audit>=2.10",            # scan installed dependencies for known advisories
 ]
 
 [tool.ruff]
