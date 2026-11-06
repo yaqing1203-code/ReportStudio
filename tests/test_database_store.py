@@ -87,3 +87,14 @@ def test_sources_for_comprehensive_combines_brief_and_articles(temp_db):
 
 def test_get_unknown_session_returns_none(temp_db):
     assert temp_db.get_session("does-not-exist") is None
+
+
+def test_session_preserves_source_credibility(temp_db):
+    from core_engine.report.models import CredibilityLevel
+
+    sid = temp_db.create_session("topic")
+    source = Source("https://cdc.gov/a", "cdc.gov", "Official release", SourceKind.GOVERNMENT,
+                    text="source text", credibility=CredibilityLevel.L1)
+    temp_db.save_brief(sid, job_id="job1", status="completed", sources=[source])
+    restored = temp_db.sources_for_comprehensive(sid)
+    assert restored[0].credibility is CredibilityLevel.L1

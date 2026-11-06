@@ -95,7 +95,7 @@ def test_build_all_aggregates_comparison_matrix():
     # signature back-compat: clusters optional, key always present
     assert build_all(kg)["comparison_matrix"] == ""
     with_clusters = build_all(kg, _clusters())
-    assert "\\begin{tabular}" in with_clusters["comparison_matrix"]
+    assert with_clusters["comparison_matrix"] == ""  # raw clusters are not source/scope validated
 
 
 # --------------------------------------------------------------------------
@@ -119,16 +119,18 @@ def _pipeline_fixture(*, with_isolated: bool):
         {"text": "The AlphaCo market grew 15 percent in 2023."},
     ])
     pages = {
-        "https://iea.org/alphaco": "IEA report on AlphaCo with revenue details. " * 8,
-        "https://oecd.org/alphaco": "OECD report on AlphaCo with revenue details. " * 8,
+        "https://iea.org/alphaco": ("AlphaCo revenue was 10 USD bn (domestic only). "
+                                   "The AlphaCo market grew 15 percent in 2023. " * 8),
+        "https://oecd.org/alphaco": ("AlphaCo revenue was 10 USD bn (global). "
+                                    "The AlphaCo market grew 15 percent in 2023. " * 8),
     }
     if with_isolated:
         llm.set_structured_claims("https://blog.example.com/alphaco", [
-            {"text": "AlphaCo plans a secret factory in 2026.",
+            {"text": "AlphaCo plans a secret factory with 2 GW capacity in 2026.",
              "entity": "AlphaCo", "attribute": "capacity", "value": "2 GW"},
         ])
-        pages["https://blog.example.com/alphaco"] = ("Blog post about AlphaCo "
-                                                     "plans and rumors. " * 8)
+        pages["https://blog.example.com/alphaco"] = (
+            "AlphaCo plans a secret factory with 2 GW capacity in 2026. " * 8)
     search = FakeSearchProvider()
     search.add("alphaco", [SearchHit(u, "Report", "", u.split("/")[2]) for u in pages])
     return llm, search, FakeFetcher(pages)
@@ -161,10 +163,10 @@ async def test_pipeline_emits_source_comparison_and_matrix(pipeline_env):
 
     tex = Path(result.tex_path).read_text(encoding="utf-8")
     assert "Source Comparison" in tex            # the drafted section heading
-    assert "\\begin{tabular}" in tex             # the comparison matrix block
-    assert "10 USD bn" in tex                    # cluster values rendered
-    # No isolated claims in this fixture -> full-corroboration statement.
-    assert "All key claims were corroborated by multiple independent sources." in tex
+    assert "\\begin{tabular}" not in tex         # incomplete scope must not render a numeric matrix
+    assert any(entry["block"] == "comparison_matrix" and entry["status"] == "withheld"
+               for entry in result.report.chart_audit)
+    assert "Source count and authority do not establish independent corroboration" in tex
 
 
 async def test_pipeline_limitations_lists_isolated_claims(pipeline_env):

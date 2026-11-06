@@ -68,6 +68,7 @@ class SearchCache:
                     title=h.get("title", ""),
                     snippet=h.get("snippet", ""),
                     domain=h.get("domain", ""),
+                    metadata=h.get("metadata", {}),
                 )
                 for h in data["hits"]
             ]
@@ -83,7 +84,7 @@ class SearchCache:
             "query": query,
             "hits": [
                 {"url": h.url, "title": h.title, "snippet": h.snippet,
-                 "domain": h.domain}
+                 "domain": h.domain, "metadata": h.metadata}
                 for h in hits
             ],
         }

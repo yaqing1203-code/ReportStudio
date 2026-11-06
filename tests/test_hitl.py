@@ -61,10 +61,10 @@ def _fixture(shared_only: bool = False):
     llm.set_structured_claims(_URL_B, [{"text": t} for t in claims_b])
     sources = [
         Source(_URL_A, "tradejournal-a.example.com", "Journal A",
-               SourceKind.GENERAL_WEB, text="body A",
+               SourceKind.GENERAL_WEB, text=" ".join(claims_a),
                credibility=CredibilityLevel.L3),
         Source(_URL_B, "tradejournal-b.example.com", "Journal B",
-               SourceKind.GENERAL_WEB, text="body B",
+               SourceKind.GENERAL_WEB, text=" ".join(claims_b),
                credibility=CredibilityLevel.L3),
     ]
     return llm, sources
@@ -235,7 +235,11 @@ def client(monkeypatch, tmp_path):
 
     from core_engine.app.server import create_app
 
-    return TestClient(create_app())
+    try:
+        with TestClient(create_app(), base_url="http://127.0.0.1") as client:
+            yield client
+    finally:
+        get_settings.cache_clear()
 
 
 def _make_job(job_id: str):

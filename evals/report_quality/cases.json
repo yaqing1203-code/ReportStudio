@@ -1,0 +1,499 @@
+{
+  "schema_version": 1,
+  "version": "2026-11-03.v1",
+  "captured_at": "2026-11-03T00:00:00+08:00",
+  "annotation_method": "Manually curated fact and adversarial criteria, checked against linked primary releases. Short whitespace-normalized verbatim excerpts; not full documents. Not independently double-annotated.",
+  "rubric": {
+    "factual_correctness": "Check entity, value, direction, unit, geography, period and release version against the pinned source.",
+    "citation_correctness": "Each cited passage must support the whole material assertion. A valid offset alone is not semantic support.",
+    "question_coverage": "Answer the requested question and identify material evidence gaps.",
+    "analysis_quality": "Explain implications with explicit assumptions and counter-evidence. Human score 0-4; never inferred from lexical metrics.",
+    "language_and_readability": "Respect requested language and write coherent, non-repetitive prose.",
+    "uncertainty": "Preserve preliminary/final release status, annualized rates, and unavailable information."
+  },
+  "sources": [
+    {
+      "id": "nbs-preliminary",
+      "url": "https://www.stats.gov.cn/zwfwck/sjfb/202502/t20250228_1958817.html",
+      "title": "中华人民共和国2024年国民经济和社会发展统计公报（初步核算）",
+      "published_at": "2025-02-28",
+      "text": "初步核算，全年国内生产总值[2]1349084亿元，比上年增长5.0%。",
+      "sha256": "25b07fc80c2c8f7d1df8361a66deb4333b9f92bf8735cd38d8eafaa4282bb538"
+    },
+    {
+      "id": "nbs-final",
+      "url": "https://www.stats.gov.cn/sj/zxfbhjd/202512/t20251226_1962144.html",
+      "title": "国家统计局关于2024年国内生产总值最终核实的公告",
+      "published_at": "2025-12-26",
+      "text": "经最终核实，2024年，GDP现价总量为1348066亿元，比初步核算数减少1018亿元；按不变价格计算，比上年增长5.0%，与初步核算数持平。\n\n行业 | 现价总量（亿元） | 不变价增速（％） | 产业结构（％）\n房地产业 | 84047 | -2.2 | 6.2",
+      "sha256": "02a57a658f0f135bbfb227fb9fcea2659796e6d8525ca930b1fc62ed604f5bf3"
+    },
+    {
+      "id": "bea-2024-second",
+      "url": "https://www.bea.gov/news/2025/gross-domestic-product-4th-quarter-and-year-2024-second-estimate",
+      "title": "GDP, fourth quarter and year 2024, second estimate (historical vintage)",
+      "published_at": "2025-02-27",
+      "text": "Real gross domestic product (GDP) increased at an annual rate of 2.3 percent in the fourth quarter of 2024 (October, November, and December), according to the second estimate released by the U.S. Bureau of Economic Analysis. In the third quarter, real GDP increased 3.1 percent.\n\nReal GDP increased 2.8 percent in 2024 (from the 2023 annual level to the 2024 annual level), the same as previously estimated.",
+      "sha256": "1c1197cae3161e1cb772ba6620a2c17da6b7915270b23e6f9ee518390d413347"
+    },
+    {
+      "id": "bls-december-2024",
+      "url": "https://www.bls.gov/news.release/archives/cpi_01152025.htm",
+      "title": "Consumer Price Index, December 2024 (January 2025 historical release)",
+      "published_at": "2025-01-15",
+      "text": "The Consumer Price Index for All Urban Consumers (CPI-U) increased 0.4 percent on a seasonally adjusted basis in December, after rising 0.3 percent in November, the U.S. Bureau of Labor Statistics reported today.\n\nThe all items index rose 2.9 percent for the 12 months ending December, after rising 2.7 percent over the 12 months ending November. The all items less food and energy index rose 3.2 percent over the last 12 months. The energy index decreased 0.5 percent for the 12 months ending December.",
+      "sha256": "bf873fffe55e834cbde9bc04cf48680597fe2e52b6d9ebe469d855341ad0cfd3"
+    },
+    {
+      "id": "irena-capacity-2024",
+      "url": "https://www.irena.org/News/pressreleases/2025/Mar/Record-Breaking-Annual-Growth-in-Renewable-Power-Capacity",
+      "title": "Record-Breaking Annual Growth in Renewable Power Capacity (2024 stock, 2025 release)",
+      "published_at": "2025-03-26",
+      "text": "renewable power capacity during 2024, reaching 4 448 gigawatts (GW).\n\na record rate of annual growth (15.1%).",
+      "sha256": "fbe146d989e9bae54ec3c102b8c37af477780cd891689695d8792f7d4dc76df6"
+    }
+  ],
+  "cases": [
+    {
+      "id": "zh-preliminary-level",
+      "locale": "zh",
+      "question": "说明2024年中国GDP初步核算的现价总量，保留亿元单位和初步口径。",
+      "source_ids": [
+        "nbs-preliminary"
+      ],
+      "required_facts": [
+        {
+          "id": "prelim-level",
+          "required_patterns": [
+            "初步",
+            "1349084",
+            "亿元"
+          ],
+          "numeric_reference": "1349084亿元",
+          "source_ids": [
+            "nbs-preliminary"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "zh-preliminary-growth",
+      "locale": "zh",
+      "question": "说明统计公报中的GDP同比增长率，保留小数点与百分比。",
+      "source_ids": [
+        "nbs-preliminary"
+      ],
+      "required_facts": [
+        {
+          "id": "prelim-growth",
+          "required_patterns": [
+            "增长",
+            "5\\.0"
+          ],
+          "numeric_reference": "5%",
+          "source_ids": [
+            "nbs-preliminary"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "zh-final-level",
+      "locale": "zh",
+      "question": "按最终核实版本报告2024年中国GDP现价总量。",
+      "source_ids": [
+        "nbs-final"
+      ],
+      "required_facts": [
+        {
+          "id": "final-level",
+          "required_patterns": [
+            "最终",
+            "2024",
+            "1348066",
+            "亿元"
+          ],
+          "numeric_reference": "1348066亿元",
+          "source_ids": [
+            "nbs-final"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "zh-downward-revision",
+      "locale": "zh",
+      "question": "说明2024年GDP最终数相对初步数的修订方向与金额。",
+      "source_ids": [
+        "nbs-final"
+      ],
+      "required_facts": [
+        {
+          "id": "revision",
+          "required_patterns": [
+            "减少",
+            "1018",
+            "亿元"
+          ],
+          "numeric_reference": "1018亿元",
+          "source_ids": [
+            "nbs-final"
+          ]
+        }
+      ],
+      "forbidden_patterns": [
+        "增加1018"
+      ]
+    },
+    {
+      "id": "zh-release-versions",
+      "locale": "zh",
+      "question": "比较2024年GDP初步与最终版本，必须保留版本标签。",
+      "source_ids": [
+        "nbs-preliminary",
+        "nbs-final"
+      ],
+      "required_facts": [
+        {
+          "id": "prelim",
+          "required_patterns": [
+            "初步",
+            "1349084"
+          ],
+          "numeric_reference": "1349084亿元",
+          "source_ids": [
+            "nbs-preliminary"
+          ]
+        },
+        {
+          "id": "final",
+          "required_patterns": [
+            "最终",
+            "1348066"
+          ],
+          "numeric_reference": "1348066亿元",
+          "source_ids": [
+            "nbs-final"
+          ]
+        }
+      ],
+      "forbidden_patterns": [
+        "最终[^。]{0,12}1349084"
+      ]
+    },
+    {
+      "id": "zh-final-growth",
+      "locale": "zh",
+      "question": "报告最终核实版本中的GDP不变价增速，不要把增长率当作现价金额。",
+      "source_ids": [
+        "nbs-final"
+      ],
+      "required_facts": [
+        {
+          "id": "real-growth",
+          "required_patterns": [
+            "不变价格",
+            "增长5\\.0"
+          ],
+          "numeric_reference": "5%",
+          "source_ids": [
+            "nbs-final"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "zh-negative-industry",
+      "locale": "zh",
+      "question": "列出最终核实表中房地产业不变价增速，保留负号。",
+      "source_ids": [
+        "nbs-final"
+      ],
+      "required_facts": [
+        {
+          "id": "negative-growth",
+          "required_patterns": [
+            "房地产业",
+            "-2\\.2"
+          ],
+          "numeric_reference": "-2.2",
+          "source_ids": [
+            "nbs-final"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "en-quarter-annualized",
+      "locale": "en",
+      "question": "Report Q4 2024 US real GDP growth from the second estimate, explicitly preserving the annualized convention.",
+      "source_ids": [
+        "bea-2024-second"
+      ],
+      "required_facts": [
+        {
+          "id": "q4",
+          "required_patterns": [
+            "annual rate|annualized",
+            "fourth quarter|q4",
+            "2\\.3"
+          ],
+          "numeric_reference": "2.3%",
+          "source_ids": [
+            "bea-2024-second"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "en-third-quarter",
+      "locale": "en",
+      "question": "State US third-quarter real GDP growth as reported in the pinned BEA second estimate.",
+      "source_ids": [
+        "bea-2024-second"
+      ],
+      "required_facts": [
+        {
+          "id": "q3",
+          "required_patterns": [
+            "third quarter|q3",
+            "3\\.1"
+          ],
+          "numeric_reference": "3.1%",
+          "source_ids": [
+            "bea-2024-second"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "en-annual-growth",
+      "locale": "en",
+      "question": "State US real GDP growth for the whole of 2024, distinguishing it from Q4 annualized growth.",
+      "source_ids": [
+        "bea-2024-second"
+      ],
+      "required_facts": [
+        {
+          "id": "annual",
+          "required_patterns": [
+            "2024",
+            "2\\.8",
+            "annual level|whole year|full year"
+          ],
+          "numeric_reference": "2.8%",
+          "source_ids": [
+            "bea-2024-second"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "en-quarter-comparison",
+      "locale": "en",
+      "question": "Compare Q3 and Q4 GDP growth using the pinned historical release.",
+      "source_ids": [
+        "bea-2024-second"
+      ],
+      "required_facts": [
+        {
+          "id": "q3",
+          "required_patterns": [
+            "third quarter|q3",
+            "3\\.1"
+          ],
+          "numeric_reference": "3.1%",
+          "source_ids": [
+            "bea-2024-second"
+          ]
+        },
+        {
+          "id": "q4",
+          "required_patterns": [
+            "fourth quarter|q4",
+            "2\\.3"
+          ],
+          "numeric_reference": "2.3%",
+          "source_ids": [
+            "bea-2024-second"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "en-monthly-cpi",
+      "locale": "en",
+      "question": "Describe December CPI-U monthly inflation, preserving seasonal adjustment and the monthly period.",
+      "source_ids": [
+        "bls-december-2024"
+      ],
+      "required_facts": [
+        {
+          "id": "monthly",
+          "required_patterns": [
+            "cpi-u|consumer price index",
+            "seasonally adjusted",
+            "december",
+            "0\\.4"
+          ],
+          "numeric_reference": "0.4%",
+          "source_ids": [
+            "bls-december-2024"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "en-headline-inflation",
+      "locale": "en",
+      "question": "Report headline CPI inflation for the 12 months ending December from this release.",
+      "source_ids": [
+        "bls-december-2024"
+      ],
+      "required_facts": [
+        {
+          "id": "headline",
+          "required_patterns": [
+            "all items",
+            "12 months",
+            "2\\.9"
+          ],
+          "numeric_reference": "2.9%",
+          "source_ids": [
+            "bls-december-2024"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "en-core-inflation",
+      "locale": "en",
+      "question": "Report core inflation, keeping the exclusion of food and energy explicit.",
+      "source_ids": [
+        "bls-december-2024"
+      ],
+      "required_facts": [
+        {
+          "id": "core",
+          "required_patterns": [
+            "less food and energy|excluding food and energy",
+            "3\\.2"
+          ],
+          "numeric_reference": "3.2%",
+          "source_ids": [
+            "bls-december-2024"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "en-energy-direction",
+      "locale": "en",
+      "question": "Describe energy price change over the 12 months ending December; preserve the decrease direction.",
+      "source_ids": [
+        "bls-december-2024"
+      ],
+      "required_facts": [
+        {
+          "id": "energy",
+          "required_patterns": [
+            "energy index",
+            "decreased|declined|fell",
+            "0\\.5"
+          ],
+          "numeric_reference": "0.5%",
+          "source_ids": [
+            "bls-december-2024"
+          ]
+        }
+      ],
+      "forbidden_patterns": [
+        "energy index increased 0\\.5"
+      ]
+    },
+    {
+      "id": "en-renewable-stock",
+      "locale": "en",
+      "question": "State renewable power capacity in 2024 in GW, retaining the thousands grouping correctly.",
+      "source_ids": [
+        "irena-capacity-2024"
+      ],
+      "required_facts": [
+        {
+          "id": "stock",
+          "required_patterns": [
+            "capacity",
+            "2024",
+            "4 ?448",
+            "gigawatts|gw"
+          ],
+          "numeric_reference": "4448 GW",
+          "source_ids": [
+            "irena-capacity-2024"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "en-renewable-growth",
+      "locale": "en",
+      "question": "State the reported annual rate of renewable capacity growth without shifting the decimal point.",
+      "source_ids": [
+        "irena-capacity-2024"
+      ],
+      "required_facts": [
+        {
+          "id": "capacity-growth",
+          "required_patterns": [
+            "annual growth",
+            "15\\.1"
+          ],
+          "numeric_reference": "15.1%",
+          "source_ids": [
+            "irena-capacity-2024"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "zh-cross-language",
+      "locale": "zh",
+      "question": "用中文报告BEA该历史版本中的2024年全年美国实际GDP增长率，并明确全年口径。",
+      "source_ids": [
+        "bea-2024-second"
+      ],
+      "required_facts": [
+        {
+          "id": "annual",
+          "required_patterns": [
+            "2024",
+            "2\\.8",
+            "annual level|全年"
+          ],
+          "numeric_reference": "2.8%",
+          "source_ids": [
+            "bea-2024-second"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "insufficient-profit-evidence",
+      "locale": "zh",
+      "question": "根据所给统计资料确定某一家固态电池企业2025年净利润；资料没有企业利润数据时应明确无法回答。",
+      "source_ids": [
+        "nbs-preliminary"
+      ],
+      "required_facts": [],
+      "expected_abstention": true
+    },
+    {
+      "id": "empty-source-abstention",
+      "locale": "en",
+      "question": "Produce supported market-share figures with no source material; do not fabricate a value.",
+      "source_ids": [],
+      "required_facts": [],
+      "expected_abstention": true
+    }
+  ]
+}

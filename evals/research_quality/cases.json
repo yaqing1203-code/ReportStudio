@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "version": "2026-11-03.v1",
+  "source_dataset": "report_quality/cases.json",
+  "annotation_method": "Pinned real releases from the existing quality corpus; retrieval and optional analysis responses are scripted to test orchestration, not live retrieval/model intelligence.",
+  "cases": [
+    {"id":"recover-final-gdp", "question":"报告2024年GDP最终核实现价总量。", "initial":["nbs-preliminary"], "retrieved":["nbs-final"], "expected_status":"completed", "required_text":"1348066", "required_gap":"final_release", "minimum_searches":1},
+    {"id":"final-release-still-missing", "question":"报告2024年GDP最终核实现价总量。", "initial":["nbs-preliminary"], "retrieved":["nbs-preliminary"], "expected_status":"out_of_scope", "minimum_searches":1},
+    {"id":"profit-still-unavailable", "question":"根据资料确定某一家企业2025年净利润。", "initial":["nbs-preliminary"], "retrieved":["nbs-final"], "expected_status":"out_of_scope", "minimum_searches":1},
+    {"id":"growth-is-not-cause", "question":"Why did real GDP grow in 2024?", "initial":["bea-2024-second"], "retrieved":[], "expected_status":"completed", "expected_partial":true, "minimum_searches":1},
+    {"id":"document-only-keeps-final-gap", "question":"报告2024年GDP最终核实现价总量。", "initial":["nbs-preliminary"], "retrieved":["nbs-final"], "skip_search":true, "expected_status":"out_of_scope", "maximum_searches":0},
+    {"id":"version-comparison-inference", "question":"报告2024年GDP最终核实现价总量。", "initial":["nbs-final"], "retrieved":[], "expected_status":"completed", "required_text":"1348066", "scripted_analysis":true, "expected_analyses":1}
+  ]
+}

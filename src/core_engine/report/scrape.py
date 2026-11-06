@@ -18,8 +18,8 @@ Providers:
   - "jina"       : Jina Reader search (CE_JINA_API_KEY optional).
 
 When no provider is explicitly injected and `search_router_enabled` is on, queries
-are routed per query type through report/router.py (backend fallback chains) and
-results are cached on disk via report/search_cache.py.
+use the configured primary and at most one fallback through report/router.py, with
+on-demand academic discovery and per-provider disk caching.
 
 The real fetcher honours robots.txt and a timeout; extraction strips boilerplate
 to main content so the verifier quotes real prose, not nav chrome.
@@ -28,10 +28,15 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Protocol
+import re
+from dataclasses import replace
+from typing import Any, Protocol
+from urllib.robotparser import RobotFileParser
 
 from core_engine.config import get_settings
+from core_engine.report.discovery import equivalent_terms
 from core_engine.report.models import SearchHit, Source, SourceKind
+from core_engine.report.scholarly import FetchedDocument
 from core_engine.report.search_cache import SearchCache
 from core_engine.report.sources import (
     classify,
@@ -39,6 +44,8 @@ from core_engine.report.sources import (
     extract_domain,
     filter_hits,
 )
+from core_engine.report.text import lexical_tokens, normalize_text
+from core_engine.security.network import read_public_text
 
 log = logging.getLogger(__name__)
 
@@ -58,7 +65,7 @@ class SearchProvider(Protocol):
 
 
 class Fetcher(Protocol):
-    async def fetch(self, url: str) -> str | None: ...
+    async def fetch(self, url: str) -> str | FetchedDocument | None: ...
 
 
 # --------------------------------------------------------------------------
@@ -93,7 +100,7 @@ class FakeFetcher:
     def add(self, url: str, text: str) -> None:
         self._pages[url] = text
 
-    async def fetch(self, url: str) -> str | None:
+    async def fetch(self, url: str) -> str | FetchedDocument | None:
         return self._pages.get(url)
 
 
@@ -200,20 +207,14 @@ class DuckDuckGoSearchProvider:
     async def search(self, topic: str, *, max_results: int) -> list[SearchHit]:
         # Primary: the maintained ddgs/duckduckgo_search library (handles the VQD
         # challenge token DuckDuckGo now requires). Fallback: raw HTML scrape.
+        if max_results <= 0:
+            return []
         hits = await self._via_library(topic, max_results)
         if hits:
             return hits
-        hits = await self._via_html(topic, max_results)
-        if hits:
-            return hits
-        # Both paths returned nothing. DuckDuckGo is very likely challenge-blocking this
-        # environment (it now serves HTTP 202 stubs to programmatic clients). Surface
-        # that loudly instead of masquerading as 'no results / out of scope'.
-        raise SearchUnavailableError(
-            "DuckDuckGo returned no results — it is likely blocking automated queries "
-            "from this network (HTTP 202 bot-challenge). Configure a Tavily API key in "
-            "Settings (search provider = 'tavily') for reliable search."
-        )
+        # A successful empty response is not proof of a bot challenge. The HTML
+        # path reports observed HTTP/network failures separately.
+        return await self._via_html(topic, max_results)
 
     async def _via_library(self, topic: str, max_results: int) -> list[SearchHit]:
         """Use ddgs (preferred) or the legacy duckduckgo_search package if present.
@@ -269,12 +270,14 @@ class DuckDuckGoSearchProvider:
                 resp = await client.post(self._ENDPOINT, data={"q": topic})
                 # HTTP 202 = DDG bot challenge; there will be no results to parse.
                 if resp.status_code == 202:
-                    return []
+                    raise SearchUnavailableError("DuckDuckGo returned HTTP 202 (bot challenge)")
                 resp.raise_for_status()
                 body = resp.text
+        except SearchUnavailableError:
+            raise
         except Exception as e:
             log.warning("duckduckgo HTML search failed for %r: %s", topic, e)
-            return []
+            raise SearchUnavailableError(f"DuckDuckGo HTML retrieval failed ({type(e).__name__})") from None
 
         hits: list[SearchHit] = []
         seen: set[str] = set()
@@ -440,69 +443,183 @@ class HttpFetcher:
 
     def __init__(self) -> None:
         self._s = get_settings()
-        self._robots_cache: dict[str, bool] = {}
+        self._robots_cache: dict[str, RobotFileParser | None] = {}
+        self.failures: dict[str, str] = {}
 
     async def _allowed(self, client, url: str) -> bool:
         if not self._s.scrape_respect_robots:
             return True
         from urllib.parse import urlsplit
-        from urllib.robotparser import RobotFileParser
 
         parts = urlsplit(url)
         root = f"{parts.scheme}://{parts.netloc}"
         if root in self._robots_cache:
-            allowed_root = self._robots_cache[root]
-            if not allowed_root:
-                return False
+            cached = self._robots_cache[root]
+            return (cached.can_fetch(self._s.scrape_user_agent, url) if cached is not None
+                    else self._s.scrape_robots_fail_open)
         rp = RobotFileParser()
         try:
             # Short, dedicated timeout: a slow/absent robots.txt must not double the
             # per-page latency. If we can't read it quickly, the fail-open/fail-closed
             # policy (scrape_robots_fail_open) decides; fetches are still rate-limited
             # via the page fetch's own timeout.
-            resp = await client.get(f"{root}/robots.txt",
-                                    timeout=self._s.robots_timeout_s)
+            resp = await read_public_text(
+                client, f"{root}/robots.txt", max_bytes=256 * 1024,
+                timeout=self._s.robots_timeout_s)
             rp.parse(resp.text.splitlines())
             ok = rp.can_fetch(self._s.scrape_user_agent, url)
+            self._robots_cache[root] = rp
         except Exception:
             # No robots.txt reachable -> permit or skip per scrape_robots_fail_open
             # (either way the page fetch itself is still rate-limited).
             ok = self._s.scrape_robots_fail_open
-        self._robots_cache[root] = ok
+            self._robots_cache[root] = None
         return ok
 
-    async def fetch(self, url: str) -> str | None:
+    async def fetch(self, url: str) -> str | FetchedDocument | None:
         # HARD per-URL ceiling: robots + page combined can never exceed this, so one
         # hanging server cannot stall the whole gather step. Degrades to None (skip).
+        return await self._bounded_fetch(url, allow_public_redirects=False)
+
+    async def fetch_fulltext(self, url: str) -> str | FetchedDocument | None:
+        """Follow credential-free, robots-checked public copy redirects; retain the final URL."""
+        return await self._bounded_fetch(url, allow_public_redirects=True)
+
+    async def _bounded_fetch(self, url: str, *, allow_public_redirects: bool) -> str | FetchedDocument | None:
+        self.failures.pop(url, None)
+        timeout = self._s.research_fulltext_timeout_s if allow_public_redirects else self._s.scrape_per_url_timeout_s
         try:
             return await asyncio.wait_for(
-                self._fetch_inner(url), timeout=self._s.scrape_per_url_timeout_s)
+                self._fetch_inner(url, allow_public_redirects=allow_public_redirects), timeout=timeout)
         except TimeoutError:
+            self.failures[url] = "timeout"
             log.warning("fetch timed out (>%.0fs) for %s — skipping",
-                        self._s.scrape_per_url_timeout_s, url)
+                        timeout, url)
             return None
         except Exception as e:
+            self.failures[url] = type(e).__name__
             log.warning("fetch failed for %s: %s", url, e)
             return None
 
-    async def _fetch_inner(self, url: str) -> str | None:
+    async def _fetch_inner(self, url: str, *, allow_public_redirects=False) -> str | FetchedDocument | None:
         import httpx
 
         headers = {"User-Agent": self._s.scrape_user_agent}
+        from core_engine.report.openalex import api_work_id
+
+        openalex_id = api_work_id(url)
+        if openalex_id and self._s.openalex_api_key and not allow_public_redirects:
+            headers["Authorization"] = "Bearer " + self._s.openalex_api_key
         try:
             async with httpx.AsyncClient(
-                timeout=self._s.scrape_timeout_s, headers=headers, follow_redirects=True
+                timeout=self._s.scrape_timeout_s, headers=headers,
+                follow_redirects=False, trust_env=False,
             ) as client:
                 if not await self._allowed(client, url):
+                    self.failures[url] = "robots_disallowed"
                     log.info("robots.txt disallows %s", url)
                     return None
-                resp = await client.get(url)
-                resp.raise_for_status()
+                resp = await read_public_text(
+                    client, url, max_bytes=self._s.scrape_max_download_bytes,
+                    timeout=self._s.research_fulltext_timeout_s if allow_public_redirects else self._s.scrape_timeout_s,
+                    **({"allow_public_redirects": True, "before_request": lambda target: self._allowed(client, target)}
+                       if allow_public_redirects else {}))
+                content_type = resp.headers.get("content-type", "text/html").split(";")[0].strip()
+                if content_type.lower() == "application/pdf" or resp.content.startswith(b"%PDF-"):
+                    from core_engine.report.documents import parse_document
+
+                    _title, text = await asyncio.to_thread(parse_document, "source.pdf", resp.content)
+                    from core_engine.report.scholarly import normalize_doi
+                    from core_engine.report.tables import append_tables, extract_tables
+
+                    identifiers = {doi for match in re.findall(r"10\.\d{4,9}/[a-zA-Z0-9_./:;()\-]+", text[:6000])
+                                   if (doi := normalize_doi(match.rstrip(".,;")))}
+                    try:
+                        tables = await asyncio.to_thread(extract_tables, resp.content, "pdf")
+                    except Exception:
+                        tables = []  # Table parsing is optional; keep readable PDF text.
+                    text, tables = append_tables(text, tables)
+                    return FetchedDocument(text, "pdf", metadata={"full_text_accessed": True,
+                        "doi": next(iter(identifiers)) if len(identifiers) == 1 else None,
+                        "actual_url": str(resp.url), **({"tables": tables,
+                            "physical_page_count": tables[0]["physical_page_count"]} if tables else {})})
+                if content_type.lower() in {"application/xml", "text/xml", "application/jats+xml"}:
+                    from core_engine.report.fulltext import jats_document
+
+                    document = jats_document(resp.text)
+                    if document is not None:
+                        document.metadata["actual_url"] = str(resp.url)
+                    if document is None:
+                        self.failures[url] = "xml_without_readable_article_body"
+                    return document
+                if content_type.lower() == "application/json":
+                    from urllib.parse import unquote, urlsplit
+
+                    from core_engine.report.openalex import openalex_document
+                    from core_engine.report.scholarly import crossref_document
+
+                    parts = urlsplit(str(resp.url))
+                    from core_engine.report.fulltext import (
+                        europe_pmc_fulltext,
+                        europe_pmc_lookup_doi,
+                    )
+
+                    lookup_doi = europe_pmc_lookup_doi(str(resp.url))
+                    if lookup_doi and allow_public_redirects:
+                        target = europe_pmc_fulltext(resp.json(), lookup_doi)
+                        if target:
+                            article = await self._fetch_inner(target, allow_public_redirects=True)
+                            if isinstance(article, FetchedDocument):
+                                from core_engine.report.scholarly import normalize_doi
+
+                                if normalize_doi(str(article.metadata.get("doi") or "")) != lookup_doi:
+                                    self.failures[url] = "fulltext_identity_mismatch"
+                                    return None
+                                article.metadata.update(fulltext_resolver="europe_pmc", resolver_entry_url=url)
+                                return article
+                            self.failures[url] = self.failures.get(target, "open_fulltext_not_available")
+                        else:
+                            self.failures[url] = "open_fulltext_not_available"
+                        return None
+                    if parts.hostname == "api.crossref.org" and parts.path.startswith("/works/"):
+                        return crossref_document(resp.json().get("message", {}), unquote(parts.path[len("/works/"):]))
+                    if openalex_id and api_work_id(str(resp.url)) == openalex_id:
+                        document = openalex_document(resp.json(), openalex_id)
+                        if document is None:
+                            self.failures[url] = "openalex_no_usable_abstract"
+                        return document
+                    return None
+                if content_type.lower() not in {"text/html", "application/xhtml+xml", "text/plain"}:
+                    self.failures[url] = "unsupported_content_type"
+                    return None
                 html = resp.text
         except Exception as e:
+            self.failures[url] = (f"http_{e.response.status_code}" if isinstance(e, httpx.HTTPStatusError) else type(e).__name__)
             log.warning("fetch failed for %s: %s", url, e)
             return None
-        return _extract_main_text(html)
+        from core_engine.report.tables import append_tables, extract_tables, strip_extracted_tables
+
+        try:
+            tables = await asyncio.to_thread(extract_tables, html, "html")
+        except Exception:
+            tables = []  # Preserve ordinary extraction if the optional adapter fails.
+        text = await asyncio.to_thread(_extract_main_text, strip_extracted_tables(html, tables))
+        from core_engine.report.fulltext import html_article_document
+
+        document = html_article_document(html, str(resp.url), text)
+        if document is not None:
+            # Declared abstracts and landing-page reference lists must not turn
+            # into full-text evidence merely because HTML contains a table.
+            if document.document_format != "abstract" and tables:
+                document.text, attached = append_tables(document.text, tables)
+                if attached:
+                    document.metadata["tables"] = attached
+            return document
+        if tables:
+            text, attached = append_tables(text, tables)
+            if attached:
+                return FetchedDocument(text, "html", metadata={"tables": attached, "actual_url": str(resp.url)})
+        return text
 
 
 def _extract_main_text(html: str) -> str:
@@ -523,6 +640,13 @@ def _extract_main_text(html: str) -> str:
     text = re.sub(r"(?s)<[^>]+>", " ", text)
     text = re.sub(r"\s+", " ", text)
     return text.strip()
+
+
+def retryable_fetch_failure(reason: str | None) -> bool:
+    """Only transport/rate/server failures merit another bounded research attempt."""
+    return reason in {"timeout", "ConnectError", "ReadError", "ReadTimeout", "ConnectTimeout",
+                      "WriteTimeout", "PoolTimeout", "RemoteProtocolError", "PublicDNSUnavailable", "gaierror"} or bool(
+        reason and (reason == "http_429" or re.fullmatch(r"http_5\d\d", reason)))
 
 
 # --------------------------------------------------------------------------
@@ -549,6 +673,14 @@ def get_search_provider(name: str | None = None) -> SearchProvider:
         return JinaSearchProvider(s.jina_api_key or None)   # key optional
     if chosen == "fake":
         return FakeSearchProvider()
+    if chosen == "crossref":
+        from core_engine.report.scholarly import CrossrefSearchProvider
+
+        return CrossrefSearchProvider()
+    if chosen == "openalex":
+        from core_engine.report.openalex import OpenAlexSearchProvider
+
+        return OpenAlexSearchProvider()
     raise RuntimeError(f"Unknown search provider: {chosen}")
 
 
@@ -592,12 +724,11 @@ def build_research_queries(topic: str) -> list[str]:
 
 def _topic_terms(topic: str) -> list[str]:
     """Meaningful lowercased terms from the topic (drop short stopwords)."""
-    import re
 
     _STOP = {"the", "a", "an", "of", "and", "or", "in", "on", "for", "to", "with",
              "vs", "via", "&"}
-    words = re.findall(r"[a-z0-9]+", topic.lower())
-    return [w for w in words if len(w) > 2 and w not in _STOP]
+    words = lexical_tokens(topic)
+    return [w for w in words if len(w) >= 2 and w not in _STOP]
 
 
 def _stem(word: str) -> str:
@@ -667,12 +798,11 @@ def relevance_score(topic: str, body: str) -> tuple[float, int]:
     This is the 'high recall then high-precision filter' step: search casts wide,
     this discards pages that only name-drop the topic.
     """
-    import re
 
     terms = _topic_terms(topic)
     if not terms:
         return 1.0, 0  # no usable terms -> don't filter on relevance
-    tokens = re.findall(r"[a-z0-9]+", body.lower())
+    tokens = lexical_tokens(body)
     if not tokens:
         return 0.0, 0
 
@@ -713,17 +843,15 @@ def _backend_name(provider) -> str:
     return type(provider).__name__.lower().removesuffix("searchprovider")
 
 
-def _freshness_score(fetched_at: str) -> float:
-    """exp(-age in years) of the fetch timestamp; 0.5 (neutral) if unparseable.
-
-    fetched_at is the time WE fetched the page (publication dates are not reliably
-    extractable), so freshly gathered sources all score ~1.0; the term matters for
-    cached/older Source objects entering the pool."""
+def _freshness_score(published_at: str | None) -> float:
+    """Publication recency; unknown dates receive a neutral score, never 'fresh'."""
     import math
     from datetime import UTC, datetime
 
     try:
-        ts = datetime.fromisoformat(fetched_at)
+        ts = datetime.fromisoformat(published_at) if published_at else None
+        if ts is None:
+            return 0.5
         if ts.tzinfo is None:
             ts = ts.replace(tzinfo=UTC)
         age_years = max(0.0, (datetime.now(UTC) - ts).total_seconds() / 86400.0 / 365.25)
@@ -739,6 +867,12 @@ async def gather_sources(
     *,
     on_progress=None,
     llm=None,
+    queries: list[str] | None = None,
+    exclude_urls: set[str] | None = None,
+    max_pages: int | None = None,
+    settings=None,
+    diagnostics: list[dict] | None = None,
+    search_purpose: str = "general",
 ) -> tuple[list[Source], list[SearchHit]]:
     """Full gather step: search -> STRICT filter -> fetch survivors -> extract.
 
@@ -749,8 +883,8 @@ async def gather_sources(
     bounds total downloads.
 
     SEARCH ROUTING: when `provider` is None and `search_router_enabled` is on, each
-    query goes through report/router.py (query-type classification + per-type backend
-    fallback chain). An explicitly-passed provider always takes the single-backend
+    query goes through the configured primary and at most one fallback. Explicit
+    academic/evidence-gap purposes can request an OpenAlex complement. An explicitly-passed provider takes the single-backend
     path, byte-for-byte the historical behavior (this is how tests pin the fake).
     Results are cached on disk (SearchCache, keyed by backend+query) for the real
     builtin backends; fake/custom providers bypass the cache.
@@ -769,12 +903,17 @@ async def gather_sources(
     Returns (authoritative_sources, rejected_hits). The rejected list is kept for the
     audit trail so we can show WHY sources were dropped.
     """
-    s = get_settings()
-    queries = build_research_queries(topic) if s.multi_query_research else [topic]
+    s = settings or get_settings()
+    queries = (build_research_queries(topic) if s.multi_query_research else [topic]) if queries is None else queries
+    queries = list(dict.fromkeys(q.strip() for q in queries if q.strip()))
+    exclude_urls = exclude_urls or set()
+    page_limit = s.scrape_max_pages if max_pages is None else min(s.scrape_max_pages, max(0, max_pages))
+    if not queries or page_limit == 0:
+        return [], []
 
     # Router mode only when the caller did NOT pin a provider. With routing off and
     # no provider given, fall back to the configured single provider.
-    use_router = provider is None and s.search_router_enabled
+    use_router = provider is None and s.search_router_enabled and s.search_provider != "fake"
     if provider is None and not use_router:
         provider = get_search_provider()
     # The disk cache is an optimization for the real networked backends; fakes and
@@ -792,10 +931,8 @@ async def gather_sources(
             except Exception:
                 pass  # progress is best-effort, never break the gather
 
-    # 1. Run all search angles CONCURRENTLY (each provider call has its own timeout and
-    #    retries). A single angle that errors is isolated — SearchUnavailableError from a
-    #    hard failure (bad key / blocked backend) still propagates so the pipeline can
-    #    surface the real reason, but a lone transient miss just yields no hits.
+    # 1. Isolate unavailable angles. Only an entirely failed batch is an outage;
+    # successful queries (including empty ones) must not lose their results.
     log.info("gather: searching %d angle(s) for %r", len(queries), topic)
     _emit(0, 0, f"Searching {len(queries)} query angle(s)…")
 
@@ -806,9 +943,10 @@ async def gather_sources(
                 # it here avoids a module-level cycle.
                 from core_engine.report.router import routed_search
 
+                purpose_args: dict[str, Any] = {"purpose": search_purpose} if search_purpose != "general" else {}
                 hits = await routed_search(
                     q, llm, max_results=s.scrape_max_results, cache=cache,
-                    on_progress=lambda msg: _emit(0, 0, msg))
+                    on_progress=lambda msg: _emit(0, 0, msg), **purpose_args)
                 return q, hits, None
             if cache is not None:
                 cached = cache.get(backend_name, q)
@@ -819,8 +957,9 @@ async def gather_sources(
             if cache is not None and hits:
                 cache.put(backend_name, q, hits)
             return q, hits, None
-        except SearchUnavailableError:
-            raise  # hard failure — let it propagate (bad key / blocked backend)
+        except SearchUnavailableError as exc:
+            _emit(0, 0, "A search angle is unavailable; retaining results from the others")
+            return q, [], exc
         except (AttributeError, NameError, TypeError, KeyError, ImportError):
             # These are CODE bugs, not transient network misses. Do NOT swallow them
             # as "skip this angle" — that once masked a config-name typo as "no results
@@ -831,30 +970,60 @@ async def gather_sources(
                         q, type(e).__name__)
             return q, [], e
 
-    search_results = await asyncio.gather(*[_one_search(q) for q in queries])
+    search_tasks = [asyncio.create_task(_one_search(q)) for q in queries]
+    try:
+        search_results = await asyncio.gather(*search_tasks)
+    finally:
+        for task in search_tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*search_tasks, return_exceptions=True)
+
+    query_records = [{"query": q, "status": "error" if error else "completed",
+                      "hit_urls": [hit.url for hit in hits], "hit_count": len(hits),
+                      "scheduled_urls": [],
+                      **({"error_type": type(error).__name__, "error": str(error)} if error else {})}
+                     for q, hits, error in search_results]
+    if diagnostics is not None:
+        diagnostics.extend(query_records)
+    if search_results and all(error is not None for _, _, error in search_results):
+        raise SearchUnavailableError("All query angles failed: " + "; ".join(
+            f"{type(error).__name__}: {error}" for _, _, error in search_results))
 
     # Merge KEPT hits by URL (dedupe pages found by multiple angles); collect rejections.
     kept_by_url: dict[str, SearchHit] = {}
+    candidate_buckets: list[list[str]] = []
     rejected: list[SearchHit] = []
     seen_rejected: set[str] = set()
     for q, hits, _err in search_results:
+        bucket: list[str] = []
         kept, rej = filter_hits(hits)
         # Cap how many NEW pages any single angle contributes, so one broad query can't
         # crowd out the section-specific ones (breadth across sections > depth on one).
         added = 0
         for hit in kept:
             if hit.url in kept_by_url:
+                old = kept_by_url[hit.url]
+                old.metadata = {**hit.metadata, **old.metadata}
+                continue
+            if hit.url in exclude_urls:
                 continue
             if added >= s.max_pages_per_query:
                 break
             kept_by_url[hit.url] = hit
+            bucket.append(hit.url)
             added += 1
+        candidate_buckets.append(bucket)
         for r in rej:
             if r.url not in seen_rejected:
                 seen_rejected.add(r.url)
                 rejected.append(r)
 
-    to_fetch = list(kept_by_url.values())[: s.scrape_max_pages]
+    to_fetch = [kept_by_url[bucket[index]] for index in range(max((len(b) for b in candidate_buckets), default=0))
+                for bucket in candidate_buckets if index < len(bucket)][:page_limit]
+    scheduled = {hit.url for hit in to_fetch}
+    for query_record, bucket in zip(query_records, candidate_buckets, strict=True):
+        query_record["scheduled_urls"] = [url for url in bucket if url in scheduled]
     log.info("gather: %d queries -> %d candidate page(s) to fetch",
              len(queries), len(to_fetch))
     _emit(0, len(to_fetch), f"Found {len(to_fetch)} page(s); fetching…")
@@ -877,47 +1046,149 @@ async def gather_sources(
 
     async def _fetch_one(hit: SearchHit):
         async with sem:
+            async def read_candidate():
+                read = getattr(fetcher, "fetch_fulltext", fetcher.fetch) if hit.metadata.get("require_fulltext") else fetcher.fetch
+                fetched = await read(hit.url)
+                if hit.metadata.get("require_fulltext") and isinstance(fetched, FetchedDocument):
+                    pdf = fetched.metadata.get("article_pdf_url")
+                    if not fetched.metadata.get("full_text_accessed") and pdf and pdf != hit.url:
+                        from core_engine.report.fulltext import public_copy_url
+
+                        if public_copy_url(pdf):
+                            value = await read(pdf)
+                            if value is not None:
+                                return replace(hit, url=pdf, domain=extract_domain(pdf), metadata={**hit.metadata,
+                                    "retrieval_entry_url": hit.url}), value
+                            hit.metadata["followup_pdf_url"] = pdf
+                            hit.metadata["followup_failure"] = getattr(fetcher, "failures", {}).get(pdf, "no_readable_content")
+                return hit, fetched
+
             try:
-                text = await asyncio.wait_for(
-                    fetcher.fetch(hit.url), timeout=fetch_budget)
+                ceiling = s.research_fulltext_timeout_s + 5 if hit.metadata.get("require_fulltext") else fetch_budget
+                actual_hit, value = await asyncio.wait_for(read_candidate(), timeout=ceiling)
+                actual_url = value.metadata.get("actual_url") if isinstance(value, FetchedDocument) else None
+                if actual_url and actual_url != actual_hit.url:
+                    actual_hit = replace(actual_hit, url=actual_url, domain=extract_domain(actual_url),
+                        metadata={**actual_hit.metadata, "retrieval_entry_url": hit.url})
+                return actual_hit, value
             except TimeoutError:
                 log.warning("gather: fetch exceeded %.0fs for %s — skipping",
-                            fetch_budget, hit.url)
+                            ceiling, hit.url)
+                hit.metadata["fetch_failure_reason"] = "timeout"
                 text = None
             except Exception as e:  # belt-and-suspenders; fetcher already guards
                 log.warning("gather: fetch crashed for %s (%s)", hit.url, type(e).__name__)
+                hit.metadata["fetch_failure_reason"] = type(e).__name__
                 text = None
         return hit, text
 
     tasks = [asyncio.create_task(_fetch_one(h)) for h in to_fetch]
     densities: dict[str, float] = {}   # url -> relevance density (for ranking below)
-    for coro in asyncio.as_completed(tasks):
-        hit, text = await coro
-        done += 1
-        _emit(done, total, f"Fetched {done}/{total} page(s), kept {len(sources)}")
-        if not text or len(text) < min_chars:
-            rejected.append(hit)
-            dropped_thin += 1
-            continue
-        kind = classify(hit.url)
-        if kind is SourceKind.REJECTED:  # denylisted — never used
-            rejected.append(hit)
-            continue
-        if s.relevance_filter:
-            density, distinct = relevance_score(topic, text)
-            if density < s.relevance_min_score or distinct < s.relevance_min_topic_hits:
-                # Mentions the topic only superficially — discard (high-precision step).
-                log.info("relevance drop %s (density=%.3f distinct=%d)",
-                         hit.url, density, distinct)
+
+    async def _collect():
+        nonlocal done, dropped_thin, dropped_irrelevant
+        for coro in asyncio.as_completed(tasks):
+            hit, fetched = await coro
+            document = fetched if isinstance(fetched, FetchedDocument) else None
+            text = document.text if document else fetched
+            done += 1
+            _emit(done, total, f"Fetched {done}/{total} page(s), kept {len(sources)}")
+            kind = classify(hit.url)
+            # Focused research summaries can be short. Keep the exception narrow:
+            # identifiable academic/official document + actual subject match + prose.
+            aliases = equivalent_terms(topic)
+            anchor_text = normalize_text(hit.title + " " + str(text or "")[:1600])
+            topic_hits = set(_topic_terms(topic)) & set(lexical_tokens(anchor_text))
+            subject_match = any(alias.casefold() in anchor_text for alias in aliases) or len(topic_hits) >= 2
+            short_primary = bool(text and len(text) >= 100 and subject_match
+                                 and kind in {SourceKind.ACADEMIC, SourceKind.GOVERNMENT, SourceKind.INDUSTRY_INSTITUTION}
+                                 and (document is not None or len(text.split()) >= 18))
+            # Long scientific articles dilute simple keyword density. A fetched
+            # open copy with the SAME header DOI plus a body subject match must
+            # not be rejected merely because most paragraphs use technical terms.
+            from core_engine.report.scholarly import normalize_doi
+
+            expected_doi = normalize_doi(str(hit.metadata.get("discovery_doi") or ""))
+            actual_doi = normalize_doi(str(document.metadata.get("doi") or "")) if document else None
+            if expected_doi and actual_doi and expected_doi != actual_doi:
+                hit.metadata["rejection_reason"] = "fulltext_identity_mismatch"
                 rejected.append(hit)
-                dropped_irrelevant += 1
                 continue
-            densities[hit.url] = density
-        sources.append(Source(
-            url=hit.url, domain=extract_domain(hit.url), title=hit.title,
-            kind=kind, text=text,
-            credibility=credibility_for(hit.url, kind),
-        ))
+            body_key = normalize_text(str(text or "")[:12000])
+            body_match = any(normalize_text(alias) in body_key for alias in aliases) or len(
+                set(_topic_terms(topic)) & set(lexical_tokens(body_key))) >= 2
+            linked_fulltext = bool(document and document.metadata.get("full_text_accessed")
+                and hit.metadata.get("require_fulltext") and expected_doi and expected_doi == actual_doi and body_match)
+            direct_fulltext = bool(document and document.metadata.get("full_text_accessed") and body_match
+                                   and (actual_doi or kind.high_trust))
+            if not text or (len(text) < min_chars and not short_primary):
+                hit.metadata["rejection_reason"] = (hit.metadata.get("fetch_failure_reason")
+                                                    or getattr(fetcher, "failures", {}).get(hit.url, "no_readable_content")
+                                                    if not text else "too_short_without_primary_subject_match")
+                rejected.append(hit)
+                dropped_thin += 1
+                continue
+            if kind is SourceKind.REJECTED:
+                rejected.append(hit)
+                continue
+            if s.relevance_filter:
+                from core_engine.report.discovery import matches_subject
+
+                if not matches_subject(topic, hit.title, text, allow_lead=document is not None):
+                    hit.metadata["rejection_reason"] = "topic_mismatch"
+                    hit.metadata["rejection_detail"] = "subject_identity_missing"
+                    rejected.append(hit)
+                    dropped_irrelevant += 1
+                    continue
+                density, distinct = relevance_score(topic, text)
+                if (density < s.relevance_min_score or distinct < s.relevance_min_topic_hits) and not (
+                        short_primary or linked_fulltext or direct_fulltext):
+                    hit.metadata["rejection_reason"] = "topic_mismatch"
+                    log.info("relevance drop %s (density=%.3f distinct=%d)", hit.url, density, distinct)
+                    rejected.append(hit)
+                    dropped_irrelevant += 1
+                    continue
+                densities[hit.url] = density
+            metadata = dict(document.metadata) if document else {}
+            if hit.metadata.get("retrieval_entry_url"):
+                metadata["retrieval_entry_url"] = hit.metadata["retrieval_entry_url"]
+            if hit.metadata.get("require_fulltext"):
+                from core_engine.report.fulltext import identity_matches
+
+                provisional = Source(hit.url, extract_domain(hit.url), hit.title, kind, text, metadata=metadata)
+                if not identity_matches(provisional, hit) or not metadata.get("full_text_accessed"):
+                    hit.metadata["rejection_reason"] = ("fulltext_identity_mismatch" if not identity_matches(provisional, hit)
+                                                         else "landing_page_without_fulltext")
+                    rejected.append(hit)
+                    continue
+            if hit.metadata.get("discovered_via") in {"openalex", "crossref"}:
+                # Keep registry link identity separate from a fetched document's
+                # own declarations. A location licence/date is version-specific.
+                for key in ("discovered_via", "discovery_openalex_id", "discovery_doi",
+                            "discovery_location", "discovery_publication_type"):
+                    if key in hit.metadata:
+                        metadata[key] = hit.metadata[key]
+                if hit.metadata.get("fulltext_parent_url"):
+                    metadata["fulltext_parent_url"] = hit.metadata["fulltext_parent_url"]
+                location = hit.metadata.get("discovery_location")
+                if (isinstance(location, dict) and location.get("version") == "submittedVersion"
+                        or hit.metadata.get("discovery_publication_type") == "preprint"):
+                    metadata.setdefault("publication_status", "preprint")
+            sources.append(Source(
+                url=hit.url, domain=extract_domain(hit.url), title=hit.title,
+                kind=kind, text=text, credibility=credibility_for(hit.url, kind),
+                document_format=document.document_format if document else "html",
+                published_at=document.published_at if document else None,
+                metadata=metadata,
+            ))
+
+    try:
+        await _collect()
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
     # CREDIBILITY-WEIGHTED RANKING: order the kept sources by
     #   relevance * rank_w_relevance + credibility.weight * rank_w_source
@@ -928,10 +1199,15 @@ async def gather_sources(
     def _rank_score(src: Source) -> float:
         return (densities.get(src.url, 0.0) * s.rank_w_relevance
                 + src.credibility.weight * s.rank_w_source
-                + _freshness_score(src.fetched_at) * s.rank_w_freshness)
+                + _freshness_score(src.published_at) * s.rank_w_freshness)
 
     sources.sort(key=_rank_score, reverse=True)
-    sources = sources[: s.scrape_max_pages]
+    sources = sources[:page_limit]
+    for record in query_records:
+        urls = set(record["hit_urls"])
+        record["retrieved_urls"] = [source.url for source in sources if source.url in urls]
+        record["rejections"] = [{"url": hit.url, "reason": hit.metadata.get("rejection_reason", "source_filter")}
+                                 for hit in rejected if hit.url in urls]
     log.info("gather: %d queries -> %d source(s) kept, %d rejected "
              "(%d thin, %d irrelevant)",
              len(queries), len(sources), len(rejected), dropped_thin, dropped_irrelevant)

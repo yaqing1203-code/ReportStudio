@@ -97,6 +97,7 @@ class SearchHit:
     title: str
     snippet: str
     domain: str
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -113,6 +114,14 @@ class Source:
     # Defaults to L3 (industry consensus) so pre-existing constructions keep a
     # neutral weight in the credibility-weighted ranking.
     credibility: CredibilityLevel = CredibilityLevel.L3
+    published_at: str | None = None
+    document_format: str = ""
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def content_sha256(self) -> str:
+        import hashlib
+        return hashlib.sha256(self.text.encode("utf-8")).hexdigest()
 
     @property
     def authoritative(self) -> bool:
@@ -137,20 +146,10 @@ class Evidence:
 
 
 class ConfidenceTier(str, Enum):
-    """How well-supported a claim is, assigned by the verification harness.
+    """Legacy ranking values, retained for stored-packet compatibility.
 
-    Semantic + circumstantial standard (not verbatim matching): a source SUPPORTS a
-    claim if it states, implies, or is consistent with the claim's underlying fact,
-    even in different wording. The pipeline keeps all non-contradicted claims and
-    labels them:
-
-      HIGH        — corroborated across multiple independent domains, OR endorsed by
-                    a high-trust (academic / gov / IGO / allowlisted) source. Fact.
-      CORROBORATED— consistently supported by >1 source, below the HIGH bar. Fact.
-      LIKELY      — supported by one credible source or strong circumstantial /
-                    consistent evidence. Reported as "Likely True".
-      RUMOR       — traceable to a source but weak/single low-trust signal. Kept,
-                    flagged as unverified.
+    Explicit reporting_status controls publication. No tier establishes truth,
+    independent replication or source reliability.
     """
 
     HIGH = "high"
@@ -160,18 +159,17 @@ class ConfidenceTier(str, Enum):
 
     @property
     def label(self) -> str:
-        return {"high": "High Confidence", "corroborated": "Corroborated",
-                "likely": "Likely True", "rumor": "Unverified / Rumor"}[self.value]
+        return {"high": "Legacy Source Support", "corroborated": "Multiple Source Groups",
+                "likely": "Source Reported", "rumor": "Needs Source Review"}[self.value]
 
 
 @dataclass(slots=True)
 class Claim:
     """An atomic, checkable factual statement extracted from the sources.
 
-    Broad-collection model: a claim is kept as long as it is TRACEABLE to at least one
-    real fetched source and NOT flagged as hallucinated (a source contradicting it or
-    asserting facts no source supports). Its `confidence` tier records how well it is
-    corroborated, so the report can separate verified facts from rumors.
+    Candidates are retained without a truth presumption. Publication requires
+    an anchored source passage and explicit source attribution. Unresolved
+    same-scope conflicts are displayed separately from conclusions and calculations.
 
     Structured-slot semantics (filled by the alignment/fusion layer, all optional):
       entity      — the subject the claim is about (normalized name, e.g. a company).
@@ -192,7 +190,7 @@ class Claim:
     # URLs proposed as supporting this claim (populated at extraction, pruned at verify).
     candidate_source_urls: list[str] = field(default_factory=list)
     evidence: list[Evidence] = field(default_factory=list)
-    verified: bool = False                       # True for HIGH/CORROBORATED tiers
+    verified: bool = False                       # legacy: source support, never factual truth
     verification_rounds: int = 0
     confidence: ConfidenceTier | None = None    # set by the harness
     # Credibility / isolation grading (see class docstring). Filled by the
@@ -205,6 +203,13 @@ class Claim:
     value: str | None = None
     qualifier: str | None = None
     time_scope: str | None = None
+    metric: dict[str, Any] | None = None
+    evidence_quality: dict[str, Any] = field(default_factory=dict)
+    # Retrieval hints from actual extraction windows; never proof of support.
+    source_windows: dict[str, list[list[int]]] = field(default_factory=dict)
+    # Publication decisions are separate from legacy ranking/confidence fields.
+    reporting_status: str = "pending"
+    conflicting_claim_ids: list[str] = field(default_factory=list)
 
     def supporting_sources(self) -> list[str]:
         """Distinct source URLs with confirmed supporting evidence."""
@@ -232,6 +237,33 @@ class DeepDive:
     kind: str                          # "bottleneck" | "policy_impact" | "competitor_edge" | ...
     paragraphs: list[str] = field(default_factory=list)
     claim_ids: list[str] = field(default_factory=list)
+    sentences: list[ReportSentence] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class SentenceCitation:
+    id: str
+    claim_id: str
+    source_url: str
+    quote: str
+    start_char: int
+    end_char: int
+    paragraph: int
+    page: int | None
+    source_sha256: str
+    method: str  # verbatim | model_entailment (source support, not factual truth)
+
+
+@dataclass(slots=True)
+class ReportSentence:
+    text: str
+    claim_ids: list[str] = field(default_factory=list)
+    citation_ids: list[str] = field(default_factory=list)
+    status: str = "withheld"  # supported | withheld | editorial
+    reason: str = ""
+    paragraph_index: int = 0
+    evidence_status: str = ""
+    attribution: str = ""
 
 
 @dataclass(slots=True)
@@ -249,14 +281,15 @@ class ReportSection:
     # Deep-dive analytical insights attached to this section (may be empty). Rendered
     # as titled subsections after the main prose + charts.
     deep_dives: list[DeepDive] = field(default_factory=list)
+    sentences: list[ReportSentence] = field(default_factory=list)
 
 
 @dataclass(slots=True)
 class ReportData:
-    """The structured, fully-verified payload handed to the LaTeX renderer.
+    """Report payload, with separate claim tiers and sentence-level source support.
 
-    By construction everything in here has passed the harness — the renderer does
-    NOT get to see unverified claims, so it cannot typeset a hallucination.
+    The pipeline audits drafted sentences before rendering. Withheld drafts remain
+    in the evidence packet; source support is not a guarantee of factual truth.
     """
 
     topic: str
@@ -272,10 +305,34 @@ class ReportData:
     # Uncorroborated single-source claims, kept and rendered in a clearly-labeled
     # "Unverified Signals & Rumors" section rather than mixed with verified facts.
     rumors: list[Claim] = field(default_factory=list)
+    citations: list[SentenceCitation] = field(default_factory=list)
+    quality_status: str = "not_audited"
+    grounding_audit: dict[str, Any] = field(default_factory=dict)
+    rumor_sentences: list[ReportSentence] = field(default_factory=list)
+    metrics: list[dict[str, Any]] = field(default_factory=list)
+    calculations: list[dict[str, Any]] = field(default_factory=list)
+    metric_issues: list[dict[str, Any]] = field(default_factory=list)
+    chart_audit: list[dict[str, Any]] = field(default_factory=list)
+    answerability: dict[str, Any] = field(default_factory=dict)
+    research_plan: dict[str, Any] = field(default_factory=dict)
+    research_audit: dict[str, Any] = field(default_factory=dict)
+    research_evidence: dict[str, Any] = field(default_factory=dict)
+    analysis: list[dict[str, Any]] = field(default_factory=list)
+    analysis_audit: dict[str, Any] = field(default_factory=dict)
+    source_quality: dict[str, Any] = field(default_factory=dict)
+    disputed_claims: list[Claim] = field(default_factory=list)
+    dispute_sentences: list[ReportSentence] = field(default_factory=list)
+    leads: list[dict[str, Any]] = field(default_factory=list)
+    evidence_policy: dict[str, Any] = field(default_factory=dict)
+
+    def all_sentences(self) -> list[ReportSentence]:
+        return ([sentence for section in self.sections
+                 for sentence in (section.sentences + [s for dive in section.deep_dives for s in dive.sentences])]
+                + self.rumor_sentences + self.dispute_sentences)
 
     def bibliography(self) -> list[Source]:
         """Sources cited by any kept claim (verified OR rumor), deduped by URL."""
-        cited = {u for c in (self.claims + self.rumors)
+        cited = {u for c in (self.claims + self.rumors + self.disputed_claims)
                  for u in c.supporting_sources()}
         seen: dict[str, Source] = {}
         for s in self.sources:
@@ -310,7 +367,13 @@ class PipelineResult:
     message: str = ""
     pdf_path: str | None = None
     tex_path: str | None = None
+    evidence_path: str | None = None
     report: ReportData | None = None
+    answerability: dict[str, Any] = field(default_factory=dict)
+    research_plan: dict[str, Any] = field(default_factory=dict)
+    research_audit: dict[str, Any] = field(default_factory=dict)
+    research_evidence: dict[str, Any] = field(default_factory=dict)
+    evidence_policy: dict[str, Any] = field(default_factory=dict)
     # Ordered, human-readable trace of every gate decision — for audit + debugging.
     trace: list[dict[str, Any]] = field(default_factory=list)
 

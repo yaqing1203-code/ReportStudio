@@ -1,53 +1,110 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="zh-CN">
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="referrer" content="no-referrer" />
 <title>Report Studio</title>
+<script src="theme.js"></script>
 <link rel="stylesheet" href="styles.css" />
+<link rel="stylesheet" href="workspace.css" />
 </head>
 <body>
   <div id="app">
     <!-- Sidebar -->
-    <aside class="sidebar">
+    <aside class="sidebar" id="sidebar" aria-label="工作区导航">
       <div class="brand">
-        <div class="brand-mark">RS</div>
+        <div class="brand-mark" aria-hidden="true"><svg viewBox="0 0 32 32" fill="none"><path d="M9 6h10l5 5v15H9z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="M19 6v6h5M13 16h7M13 20h7" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><path d="M5 11v17h14" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg></div>
         <div class="brand-text">Report Studio</div>
+        <button id="sidebar-close" class="icon-btn mobile-only" aria-label="关闭侧栏" title="关闭侧栏">×</button>
       </div>
-      <button id="new-chat" class="new-chat">+ New report</button>
+      <button id="new-chat" class="new-chat" aria-label="新建内容" title="新建内容"><span class="new-chat-plus" aria-hidden="true">＋</span><span>新建内容</span><span class="new-chat-arrow" aria-hidden="true">↗</span></button>
+      <div class="workspace-label"><span class="workspace-dot"></span>本地工作区</div>
 
-      <!-- History: past reports & chat sessions, persisted in localStorage -->
+      <!-- History: reports, chat and articles, persisted by the backend -->
       <div class="history">
         <div class="history-head">
-          <span>History</span>
-          <button id="clear-history" class="history-clear" title="Clear all history">Clear</button>
+          <span>最近的内容</span>
+          <button id="clear-history" class="history-clear" title="清空历史记录">清空</button>
         </div>
         <div id="history-list" class="history-list">
-          <div class="history-empty">No history yet.</div>
+          <div class="history-empty">暂无记录</div>
         </div>
       </div>
 
       <div class="sidebar-spacer"></div>
-      <button id="open-settings" class="settings-btn">⚙ Settings</button>
-      <div id="engine-status" class="engine-status"></div>
+      <div class="sidebar-footer">
+        <button id="open-settings" class="settings-btn" aria-label="设置" title="设置"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="m9 3-.6 2.2-2 .9-2-.6-2 3.5 1.6 1.6v2.3L2.4 15l2 3.5 2-.6 2 .9L9 21h4l.6-2.2 2-.9 2 .6 2-3.5-1.6-1.6v-2.3L19.6 9l-2-3.5-2 .6-2-.9L13 3z" stroke-linejoin="round"/><circle cx="11" cy="12" r="3"/></svg><span>设置与连接</span><span class="settings-arrow" aria-hidden="true">↗</span></button>
+        <div class="engine-status" id="engine-status"></div>
+        <div class="sidebar-caption">记录保存在本机</div>
+      </div>
     </aside>
+    <button id="sidebar-backdrop" class="sidebar-backdrop hidden" aria-label="关闭侧栏" tabindex="-1"></button>
 
     <!-- Main chat column -->
     <main class="chat">
+      <header class="workspace-header">
+        <div class="workspace-breadcrumb"><button id="sidebar-toggle" class="icon-btn mobile-only" aria-label="打开侧栏" aria-expanded="false" aria-controls="sidebar"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h16" stroke-linecap="round"/></svg></button><span class="breadcrumb-root">工作台</span><span class="breadcrumb-slash">/</span><span id="workspace-title">新建内容</span></div>
+        <div class="workspace-header-actions"><span id="workspace-mode" class="workspace-mode">智能识别</span><span id="connection-status" class="connection-status" role="status"><span class="connection-dot"></span><span>连接本地服务…</span></span><button id="theme-toggle" class="theme-toggle" type="button" aria-label="切换到暗色模式" title="切换到暗色模式" aria-pressed="false"><svg class="theme-icon-sun" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.4" aria-hidden="true"><circle cx="10" cy="10" r="3.1"/><path d="M10 1v2m0 14v2M1 10h2m14 0h2M3.6 3.6 5 5m10 10 1.4 1.4M3.6 16.4 5 15M15 5l1.4-1.4" stroke-linecap="round"/></svg><svg class="theme-icon-moon" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.4" aria-hidden="true"><path d="M17.2 12.3A7.5 7.5 0 0 1 7.7 2.8a7.5 7.5 0 1 0 9.5 9.5Z" stroke-linejoin="round"/></svg><span class="theme-label">亮色</span></button></div>
+      </header>
       <div id="messages" class="messages">
-        <div class="welcome">
-          <h1>Verified Industry Reports</h1>
-          <p>
-            Ask for a report on any industry or policy topic. Every figure and
-            claim is cross-referenced across authoritative sources before it
-            reaches the page — or the agent tells you the topic is out of scope.
-          </p>
+        <section class="welcome" aria-label="新建内容">
+          <div class="welcome-heading-row"><h1>新建内容</h1><p>选择一种方式开始，或直接在下方输入。</p></div>
           <div class="examples" id="examples">
-            <button>Solid-state battery supply chain</button>
-            <button>EU carbon border adjustment mechanism</button>
-            <button>Global semiconductor equipment market</button>
+            <button data-example-mode="report" data-prompt="生成一份固态电池技术与应用研究报告，区分全固态与半固态，注明资料来源。"><span class="example-icon research"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M5 3h10l4 4v14H5zM15 3v5h4M9 12h6M9 16h6" stroke-linejoin="round" stroke-linecap="round"/></svg></span><span class="example-body"><strong>研究报告</strong><span class="example-description">检索资料、核对证据，生成带引用的报告</span></span><span class="example-sample">试试：固态电池技术与应用</span><span class="example-arrow" aria-hidden="true">→</span></button>
+            <button data-example-mode="writing" data-prompt="以人工智能对大学学习方式的影响为主题，写一篇完整的课程文章。"><span class="example-icon writing"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="m15 4 5 5M4 20l5-1L21 7l-5-5L4 14zM4 20h16" stroke-linecap="round" stroke-linejoin="round"/></svg></span><span class="example-body"><strong>成文模式</strong><span class="example-description">根据主题与材料，撰写或修改完整文章</span></span><span class="example-sample">试试：人工智能与大学学习</span><span class="example-arrow" aria-hidden="true">→</span></button>
+            <button data-example-mode="chat" data-prompt="请用通俗的语言解释什么是固态电池，以及它和传统锂电池有什么不同。"><span class="example-icon chat-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M4 4h16v12H9l-5 4zM8 8h8M8 12h5" stroke-linejoin="round" stroke-linecap="round"/></svg></span><span class="example-body"><strong>普通聊天</strong><span class="example-description">解释概念、讨论问题，不启动报告流程</span></span><span class="example-sample">试试：什么是固态电池</span><span class="example-arrow" aria-hidden="true">→</span></button>
           </div>
+          <p class="welcome-help">上面的示例只会填入输入框，确认后再发送。</p>
+        </section>
+      </div>
+
+      <div class="composer-dock"><div class="composer-workbench">
+      <div class="mode-controls">
+        <div class="mode-buttons" role="group" aria-label="工作模式">
+          <button type="button" data-mode="chat" aria-pressed="false"><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M3 3h14v10H7l-4 4z" stroke-linejoin="round"/></svg>普通聊天</button>
+          <button type="button" data-mode="report" aria-pressed="false"><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M4 2h8l4 4v12H4zM12 2v5h4M7 11h6M7 14h5" stroke-linejoin="round"/></svg>研究报告</button>
+          <button type="button" data-mode="writing" aria-pressed="false"><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="m12 3 5 5M3 17l4-1L18 5l-4-4L3 12z" stroke-linejoin="round"/></svg>成文模式</button>
         </div>
+        <div class="mode-utilities"><label class="auto-mode"><input id="auto-mode" type="checkbox" checked /><span>自动<span class="auto-label-tail">识别</span></span></label><button id="toggle-options" class="options-toggle" type="button" aria-label="收起输出设置" title="收起输出设置" aria-expanded="true" aria-controls="composer-options"><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.4" aria-hidden="true"><path d="M4 7h12M4 13h12M7 4v6M13 10v6" stroke-linecap="round"/></svg></button></div>
+      </div>
+      <div id="generation-depth-controls" class="generation-depth-controls">
+        <span id="generation-depth-label" class="generation-depth-label">内容深度</span>
+        <div class="generation-depth-buttons" role="group" aria-labelledby="generation-depth-label" aria-describedby="generation-depth-hint">
+          <button type="button" data-depth="standard" aria-pressed="true">简洁</button>
+          <button type="button" data-depth="deep" aria-pressed="false">深入</button>
+        </div>
+        <span id="generation-depth-hint" class="generation-depth-hint">重点概述</span>
+      </div>
+      <div id="composer-options" class="composer-options">
+      <div id="output-template-controls" class="output-template-controls">
+        <div class="template-row">
+          <label for="output-template"><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.4" aria-hidden="true"><rect x="3" y="2" width="14" height="16" rx="2"/><path d="M3 7h14M8 7v11"/></svg>输出模板</label>
+          <select id="output-template"><option value="">系统默认格式</option></select>
+          <input id="template-input" type="file" accept=".docx" hidden />
+          <button id="template-upload" type="button"><span aria-hidden="true">＋</span>上传 Word 模板</button>
+          <button id="template-delete" type="button" disabled title="删除当前模板" aria-label="删除当前模板"><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.4" aria-hidden="true"><path d="M3 5h14M7 5V2h6v3M5 5l1 13h8l1-13M8 8v7M12 8v7" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+        </div>
+        <div id="template-status" class="template-status" role="status"></div>
+        <details id="template-details">
+          <summary>模板说明与封面信息<span class="detail-chevron" aria-hidden="true">⌄</span></summary>
+          <p>支持 {{title}}、{{content}}、{{date}}、{{references}} 和 {{section:章节名}}。正文或章节占位符单独占一段；也可使用 Word 章节标题。字体、页边距、页眉页脚沿用模板。<a id="template-example" href="/api/templates/example.docx" download>下载示例模板</a></p>
+          <div id="template-fields" class="template-fields"></div>
+          <p>个人信息可留空，系统不会猜填。选择模板后生成 Word，并尝试导出同版式 PDF。</p>
+        </details>
+      </div>
+      <div id="writing-options" class="writing-options hidden">
+        <div class="writing-fields">
+          <label>目标篇幅 <span class="field-unit">约字/词</span><input id="writing-length" type="number" min="400" max="4000" step="100" value="1500" /></label>
+          <label>语言风格<select id="writing-style">
+            <option value="student">课程文章</option><option value="formal">正式平实</option><option value="natural">自然流畅</option>
+          </select></label>
+          <label class="writing-check"><input id="writing-web" type="checkbox" checked /> 联网补充背景</label>
+          <label class="writing-check"><input id="writing-phrases" type="checkbox" checked /> 允许常规过渡和总结</label>
+        </div>
+        <details class="writing-materials-details"><summary>添加写作材料<span>可选 · 提纲、笔记或已有观点</span><span class="detail-chevron" aria-hidden="true">⌄</span></summary><textarea id="writing-materials" aria-label="写作材料" rows="3" maxlength="20000" placeholder="粘贴提纲、课堂笔记或需要采用的材料，内容会作为写作前提…"></textarea></details>
+        <div class="writing-context"><span id="writing-context">新文章</span><button id="writing-new" type="button">另起一篇</button></div>
+      </div>
       </div>
 
       <!-- Files the user staged via the paperclip, shown as removable chips. They
@@ -57,83 +114,100 @@
       <div class="composer">
         <input type="file" id="attach-input" multiple
                accept=".pdf,.docx,.xlsx,.csv,.txt,.md,.markdown" hidden />
-        <button id="attach-btn" class="attach-btn" title="Attach documents">
+        <button id="attach-btn" class="attach-btn" title="添加研究资料" aria-label="添加研究资料">
           <svg width="20" height="20" viewBox="0 0 24 24" fill="none"
                stroke="currentColor" stroke-width="2" stroke-linecap="round"
                stroke-linejoin="round" aria-hidden="true">
             <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>
           </svg>
         </button>
-        <textarea id="topic" rows="1" placeholder="Describe the report topic…"
+        <textarea id="topic" rows="2" placeholder="告诉我你的研究主题，或直接问一个问题…" aria-label="输入问题或主题"
                   autocomplete="off"></textarea>
-        <button id="send" class="send-btn" title="Generate report">↑</button>
+        <button id="send" class="send-btn" title="发送" aria-label="发送"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" aria-hidden="true"><path d="M12 19V5m-6 6 6-6 6 6" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+      </div>
+      <div class="composer-bottom"><span id="mode-description">自动判断聊天、研究报告或成文需求</span><span class="keyboard-hint"><kbd>Enter</kbd>发送<span>·</span><kbd>Shift Enter</kbd>换行</span></div>
       </div>
       <div class="composer-note" id="composer-note">
         A brief report is generated first. Add your own documents and it automatically
         expands into a comprehensive report combining both.
+      </div>
       </div>
     </main>
   </div>
 
   <!-- Settings modal -->
   <div id="settings-overlay" class="overlay hidden">
-    <div class="modal">
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="settings-title" tabindex="-1">
       <div class="modal-head">
-        <h2>Settings</h2>
-        <button id="close-settings" class="icon-btn">✕</button>
+        <div><h2 id="settings-title">设置与连接</h2><p>模型、检索来源与输出格式</p></div>
+        <button id="close-settings" class="icon-btn" aria-label="关闭设置">✕</button>
       </div>
       <div class="modal-body">
         <section>
-          <h3>Language model</h3>
-          <label>API protocol
+          <h3><span>01</span>语言模型</h3>
+          <label>接口协议
             <select id="llm_provider">
-              <option value="fake">Offline demo (no API)</option>
+              <option value="fake">离线演示（不连接 API）</option>
               <option value="anthropic">Anthropic</option>
-              <option value="openai">OpenAI-compatible</option>
+              <option value="openai">OpenAI 兼容接口</option>
             </select>
           </label>
-          <label>Model
-            <input id="llm_model" type="text" placeholder="claude-opus-4-8 / gpt-4o / …" />
+          <label>模型名称
+            <input id="llm_model" type="text" placeholder="填写服务商提供的模型名称" />
           </label>
-          <label id="wrap_base_url">Base URL
+          <label id="wrap_base_url">接口地址 Base URL
             <input id="llm_base_url" type="text"
                    placeholder="https://api.openai.com/v1 (OpenAI-compatible)" />
           </label>
           <label id="wrap_llm_key">API key
-            <input id="llm_api_key" type="password" placeholder="Leave blank to keep current" />
+            <input id="llm_api_key" type="password" placeholder="留空即可保留已有密钥" autocomplete="off" />
             <span id="llm_key_state" class="key-state"></span>
           </label>
           <label id="wrap_anthropic_key">Anthropic API key
-            <input id="anthropic_api_key" type="password" placeholder="Leave blank to keep current" />
+            <input id="anthropic_api_key" type="password" placeholder="留空即可保留已有密钥" autocomplete="off" />
             <span id="anthropic_key_state" class="key-state"></span>
           </label>
         </section>
 
         <section>
-          <h3>Web search</h3>
-          <label>Search backend
+          <h3><span>02</span>联网检索</h3>
+          <p class="settings-help">报告会检索来源资料；成文时可在输入区选择是否联网补充背景。</p>
+          <details id="advanced-search-settings" class="advanced-search-settings">
+          <summary>高级检索设置<span class="detail-chevron" aria-hidden="true">⌄</span></summary>
+          <div class="advanced-search-body">
+          <label>检索服务
             <select id="search_provider">
-              <option value="duckduckgo">DuckDuckGo (keyless, built-in)</option>
-              <option value="tavily">Tavily (higher quality, needs key)</option>
+              <option value="duckduckgo">DuckDuckGo（内置，无需密钥）</option>
+              <option value="tavily">Tavily（需要 API 密钥）</option>
             </select>
           </label>
-          <label id="wrap_search_key">Search API key
-            <input id="search_api_key" type="password" placeholder="Leave blank to keep current" />
+          <label id="wrap_search_key">检索 API 密钥
+            <input id="search_api_key" type="password" placeholder="留空即可保留已有密钥" autocomplete="off" />
             <span id="search_key_state" class="key-state"></span>
           </label>
+          <label class="settings-checkbox">
+            <input id="openalex_search_enabled" type="checkbox" checked />
+            OpenAlex：按需补充学术资料
+          </label>
+          <label>OpenAlex API 密钥（可选）
+            <input id="openalex_api_key" type="password" placeholder="留空即可保留已有密钥" autocomplete="off" />
+            <span id="openalex_key_state" class="key-state"></span>
+          </label>
+          </div>
+          </details>
         </section>
 
         <section>
-          <h3>Verification &amp; output</h3>
-          <label>Verification contract
+          <h3><span>03</span>证据与输出</h3>
+          <label>报告证据规则
             <select id="verify_mode">
-              <option value="traceable">Traceable (synthesis allowed, no fabricated facts)</option>
-              <option value="strict">Strict (verbatim quote required per claim)</option>
+              <option value="traceable">可追溯（允许综合表述，保留证据）</option>
+              <option value="strict">严格引用（每条论点要求原文）</option>
             </select>
           </label>
-          <label>PDF engine
+          <label>PDF 排版引擎
             <select id="latex_engine">
-              <option value="auto">Auto (prefer bundled Tectonic)</option>
+              <option value="auto">自动选择（优先内置 Tectonic）</option>
               <option value="tectonic">Tectonic</option>
               <option value="xelatex">xelatex</option>
               <option value="pdflatex">pdflatex</option>
@@ -143,7 +217,7 @@
       </div>
       <div class="modal-foot">
         <span id="settings-status" class="settings-status"></span>
-        <button id="save-settings" class="primary-btn">Save</button>
+        <button id="save-settings" class="primary-btn">保存设置</button>
       </div>
     </div>
   </div>

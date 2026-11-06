@@ -1,9 +1,9 @@
-"""Intent classification for dual-mode interaction.
+"""Intent classification for chat, research reports and complete composition.
 
-Classifies user messages as either GENERAL_CHAT or REPORT_GENERATION to route
-to the appropriate handler (direct LLM response vs. full research pipeline).
+Routes user messages to GENERAL_CHAT, REPORT_GENERATION or WRITING.
 """
 import json
+import re
 from enum import Enum
 from typing import Literal
 
@@ -14,6 +14,7 @@ class IntentType(str, Enum):
     """User intent categories."""
     GENERAL_CHAT = "general_chat"
     REPORT_GENERATION = "report_generation"
+    WRITING = "writing"
 
 
 class IntentClassification(BaseModel):
@@ -23,10 +24,16 @@ class IntentClassification(BaseModel):
     reasoning: str = ""
 
 
-# System prompts for the two modes
+# System prompts for automatic routing and ordinary chat
 CLASSIFIER_SYSTEM_PROMPT = """You are an intent classifier for a research report application.
 
-Your job: Determine if the user wants to generate a RESEARCH REPORT or just have a GENERAL CONVERSATION.
+Your job: Select GENERAL_CHAT, REPORT_GENERATION, or WRITING.
+
+WRITING indicators:
+- Explicit 成文模式, complete essays, compositions, course assignments, reflections or speeches
+- Requests to expand, polish or rewrite prose without an evidence-audited research requirement
+- Prefer WRITING for ordinary articles/essays; prefer REPORT_GENERATION when research, source verification,
+  auditable citations or a researched report is explicitly requested
 
 REPORT_GENERATION indicators:
 - Requests for reports, papers, documents, or analysis
@@ -43,7 +50,7 @@ GENERAL_CHAT indicators:
 
 Respond ONLY with valid JSON in this exact format:
 {
-  "intent": "general_chat" or "report_generation",
+  "intent": "general_chat" or "report_generation" or "writing",
   "confidence": "high" or "medium" or "low",
   "reasoning": "brief explanation"
 }
@@ -77,6 +84,7 @@ Your role in chat mode:
 - Guide users on how to request reports when appropriate
 
 Your capabilities:
+- 成文模式 creates complete articles/essays, accepts supplied material as writing premises and checks internal contradictions; it does not certify factual truth.
 - When users want a FULL RESEARCH REPORT with citations, web scraping, and PDF generation, tell them to phrase it as a clear report request (e.g., "Generate a report on X", "Analyze Y", "Research Z")
 - For quick questions, provide helpful, accurate answers immediately
 - You have access to the same LLM capabilities as the report generation, but you don't scrape the web or generate LaTeX
@@ -109,6 +117,15 @@ async def classify_intent(message: str) -> IntentClassification:
         llm = get_llm()
     except RuntimeError as e:
         raise LLMNotConfiguredError(str(e)) from e
+
+    # Explicit composition requests should not accidentally trigger costly report research.
+    help_question = re.search(r"(?:什么是|如何使用|怎么使用|怎么切换|如何切换|有哪些|几个).{0,15}(?:模式|功能)", message)
+    verified_request = re.search(r"逐句证据|事实核验|可核验.{0,6}(?:引文|引用)|研究报告|调研报告|"
+                                 r"verified research|auditable citations|\b(?:research|report)\b", message, re.IGNORECASE)
+    writing_request = re.search(r"成文模式|课程作业|心得体会|读后感|观后感|演讲稿|作文|扩写成文|"
+                                r"写(?:一篇|篇).{0,35}(?:文章|随笔)|\b(?:essay|composition)\b", message, re.IGNORECASE)
+    if writing_request and not help_question and ("成文模式" in message or not verified_request):
+        return IntentClassification(intent=IntentType.WRITING, reasoning="明确要求完整文章或成文模式")
 
     try:
         # The LLM interface exposes _complete(system, user) for a raw completion.

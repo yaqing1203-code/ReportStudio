@@ -102,7 +102,8 @@ async def test_same_calibre_same_value_corroborates_and_merges_evidence():
     for c in (a, b):
         assert set(c.candidate_source_urls) == {
             "https://iea.org/a", "https://reuters.com/b"}
-        assert {e.source_url for e in c.evidence} == set(c.candidate_source_urls)
+        assert c.evidence == []  # candidate fusion cannot manufacture source support
+        assert not c.verified and c.reporting_status == "pending"
 
 
 async def test_different_qualifier_is_complement_both_kept():
@@ -127,7 +128,22 @@ async def test_different_qualifier_is_complement_both_kept():
     assert report.reasons.get("pair:c1|c2", "").startswith("complement")
 
 
-async def test_contradiction_drops_lower_authority_claim():
+async def test_different_test_conditions_cannot_be_overruled_as_conflict_by_model():
+    class WrongConflict(FakeLLM):
+        async def check_contradiction(self, a, b):
+            raise AssertionError("Different test conditions must not reach the contradiction oracle")
+    sources = [_src("https://example.edu/a", SourceKind.ACADEMIC, CredibilityLevel.L1),
+               _src("https://example.edu/b", SourceKind.ACADEMIC, CredibilityLevel.L1)]
+    claims = [Claim("c1", "Battery energy density was 400 Wh/kg at 25 °C.", [sources[0].url],
+                    entity="battery", attribute="energy_density", qualifier="full cell at 25 °C"),
+              Claim("c2", "Battery energy density was 300 Wh/kg at 0 °C.", [sources[1].url],
+                    entity="battery", attribute="energy_density", qualifier="full cell at 0 °C")]
+    report = await VerificationHarness(WrongConflict()).verify(claims, sources)
+    assert len(report.kept_claims) == 2 and not report.rejected_claims
+    assert report.clusters[0]["relation"] == "complement"
+
+
+async def test_contradiction_retains_both_authority_levels_for_source_binding():
     gov = _src("https://bls.gov/a", SourceKind.GOVERNMENT, CredibilityLevel.L1)
     blog = _src("https://someblog.net/b", SourceKind.GENERAL_WEB, CredibilityLevel.L4)
     hi = Claim(id="gov1", text="Acme market share was 35% in 2024.",
@@ -140,9 +156,10 @@ async def test_contradiction_drops_lower_authority_claim():
                time_scope="2024")
     # FakeLLM's heuristic: same subject, diverging numbers -> contradiction.
     report = await VerificationHarness(FakeLLM()).verify([lo, hi], [gov, blog])
-    assert {c.id for c in report.kept_claims} == {"gov1"}
-    assert [c.id for c in report.rejected_claims] == ["blog1"]
-    assert "contradicted" in report.reasons["blog1"]
+    assert {c.id for c in report.kept_claims} == {"gov1", "blog1"}
+    assert report.rejected_claims == []
+    assert "unresolved conflict" in report.reasons["blog1"]
+    assert hi.conflicting_claim_ids == ["blog1"] and lo.conflicting_claim_ids == ["gov1"]
     assert report.clusters[0]["relation"] == "conflict"
 
 
@@ -157,9 +174,8 @@ async def test_unstructured_claims_use_lexical_conflict_path():
     lo = Claim(id="blog1", text="The national unemployment rate for 2024 was 9 percent.",
                candidate_source_urls=[blog.url])
     report = await VerificationHarness(FakeLLM()).verify([lo, hi], [gov, blog])
-    # Identical outcome to conflict_only: low-authority side dropped.
-    assert {c.id for c in report.kept_claims} == {"gov1"}
-    assert "contradicted" in report.reasons["blog1"]
+    assert {c.id for c in report.kept_claims} == {"gov1", "blog1"}
+    assert "unresolved conflict" in report.reasons["blog1"]
     assert report.clusters == []          # no structured clusters involved
 
 
@@ -188,7 +204,7 @@ async def test_isolated_flag_single_vs_multi_source():
 # --------------------------------------------------------------------------
 # 5. Internal consistency review downgrades credibility
 # --------------------------------------------------------------------------
-async def test_internal_inconsistency_downgrades_credibility():
+async def test_internal_inconsistency_is_a_review_flag_not_a_source_credibility_verdict():
     fake = FakeLLM()
     fake.set_complete("internal consistency reviewer",
                       json.dumps({"consistent": False, "note": "totals do not add up"}))
@@ -200,15 +216,16 @@ async def test_internal_inconsistency_downgrades_credibility():
     report = await VerificationHarness(fake).verify([c], [src])
     kept = report.kept_claims[0]
     assert kept.isolated is True
-    assert kept.credibility is CredibilityLevel.L4      # L3 downgraded one level
-    assert "downgraded" in report.reasons["c1"]
+    assert kept.credibility is CredibilityLevel.L3
+    assert "attention flag" in report.reasons["c1"]
+    assert kept.evidence_quality["model_review_flags"] == ["internal_consistency_attention"]
     assert "totals do not add up" in report.reasons["c1"]
 
 
 # --------------------------------------------------------------------------
-# 6. Baseline deviation above threshold downgrades an isolated claim
+# 6. Model outlier attention cannot change source credibility
 # --------------------------------------------------------------------------
-async def test_deviation_above_threshold_downgrades():
+async def test_deviation_above_threshold_cannot_use_model_memory_as_truth():
     fake = FakeLLM()
     fake.set_complete("deviation assessor",
                       json.dumps({"deviation": 0.9, "note": "far above field baseline"}))
@@ -218,7 +235,8 @@ async def test_deviation_above_threshold_downgrades():
               candidate_source_urls=[src.url])
     report = await VerificationHarness(fake).verify([c], [src])
     kept = report.kept_claims[0]
-    assert kept.credibility is CredibilityLevel.L4
+    assert kept.credibility is CredibilityLevel.L3
+    assert kept.evidence_quality["model_review_flags"] == ["outlier_attention"]
     assert "deviation 0.90" in report.reasons["c1"]
 
 
@@ -236,6 +254,7 @@ async def test_active_verify_query_budget_and_isolation_lift():
     fake.set_structured_claims(new_url, [{
         "text": "Acme shipments imply a market share near 35%.",
         "entity": "Acme", "attribute": "market_share", "value": "35%",
+        "time_scope": "2024",
     }])
 
     searched: list[str] = []

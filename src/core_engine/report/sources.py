@@ -8,11 +8,9 @@ Authoritative categories, in priority order:
   4. NONPROFIT             — NGO / non-profit research orgs with methodological rigor
   5. AUTHORITATIVE_MEDIA   — allowlisted mainstream outlets with editorial standards
 
-Design stance: still a hard ALLOWLIST, not a blocklist. A domain is authoritative
-only if it positively matches one of the allowlists above. Everything else is
-REJECTED by default — we would rather drop a borderline-good source than admit a bad
-one. A separate tabloid/gossip DENYLIST (小道媒体) is rejected unconditionally, even
-if it would otherwise look like general media.
+Curated hosts get source-type labels; other hosts may enter as GENERAL_WEB when
+configured. The hard denylist still wins. A host label is not proof of truth,
+peer review, replication or independent corroboration.
 
 Nothing here trusts the LLM: classification is pure string logic on the registrable
 domain, so it is deterministic and auditable.
@@ -100,7 +98,7 @@ def classify(url: str) -> SourceKind:
 
     # Academic / peer-reviewed databases FIRST (highest authority for factual/scientific
     # claims). Checked before the .gov suffix so e.g. ncbi.nlm.nih.gov reads as ACADEMIC.
-    if _in(host, s.academic_allowlist):
+    if host in {"api.crossref.org", "api.openalex.org"} or _in(host, s.academic_allowlist):
         return SourceKind.ACADEMIC
 
     # Government / IGO / .edu / .mil by suffix. We check dotted suffixes against the

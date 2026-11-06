@@ -1,9 +1,14 @@
 __pycache__/
 *.pyc
 .venv/
+.env
+.env.*
+!.env.example
 dist/
 build/
 output/
+/tmp/
+/packaging/bin/
 *.egg-info/
 network_diag.txt
 .pytest_cache/

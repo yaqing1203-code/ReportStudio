@@ -24,6 +24,7 @@ along on every element for the audit trail and in-report citation.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from decimal import Decimal
 from enum import Enum
 
 from core_engine.report.models import Claim
@@ -61,22 +62,27 @@ class MarketDatum:
     """One point in a historical market-size series."""
 
     year: int
-    value: float          # in `unit`
-    unit: str = "USD bn"
+    value: Decimal | float          # legacy proposals are audited before rendering
+    unit: str = ""
     claim_ids: list[str] = field(default_factory=list)
+    metric_id: str | None = None
 
 
 @dataclass(slots=True)
 class MarketSize:
     """TAM/SAM/SOM headline figures + a historical series for the pgfplots chart."""
 
-    tam: float | None = None
-    sam: float | None = None
-    som: float | None = None
-    unit: str = "USD bn"
-    cagr_pct: float | None = None
+    tam: Decimal | float | None = None
+    sam: Decimal | float | None = None
+    som: Decimal | float | None = None
+    unit: str = ""
+    cagr_pct: Decimal | float | None = None
     series: list[MarketDatum] = field(default_factory=list)
     claim_ids: list[str] = field(default_factory=list)
+    metric_ids: dict[str, str] = field(default_factory=dict)
+    period: str | None = None
+    cagr_period: str | None = None
+    scope_label: str = ""
 
     def has_chartable_series(self) -> bool:
         return len(self.series) >= 2
@@ -87,9 +93,10 @@ class Competitor:
     """A market player for the competitive-landscape table + share chart."""
 
     name: str
-    market_share_pct: float | None = None
+    market_share_pct: Decimal | float | None = None
     advantage: str = ""
     claim_ids: list[str] = field(default_factory=list)
+    metric_id: str | None = None
 
 
 @dataclass(slots=True)
@@ -101,6 +108,8 @@ class ReportKnowledgeGraph:
     chain_edges: list[ChainEdge] = field(default_factory=list)
     market: MarketSize = field(default_factory=MarketSize)
     competitors: list[Competitor] = field(default_factory=list)
+    numeric_validated: bool = False
+    validated_blocks: set[str] = field(default_factory=set)
 
     def tier(self, tier: ChainTier) -> list[ChainNode]:
         return [n for n in self.chain_nodes if n.tier is tier]
@@ -199,16 +208,16 @@ async def build_report_kg(topic: str, verified: list[Claim], llm) -> ReportKnowl
         d_ids = _keep_ids(d.get("claim_ids"))
         try:
             year = int(d.get("year"))
-            value = float(d.get("value"))
+            value = _num(d.get("value"))
         except (TypeError, ValueError):
             continue
-        if d_ids:
+        if d_ids and value is not None:
             series.append(MarketDatum(year=year, value=value,
-                                      unit=str(m.get("unit", "USD bn")), claim_ids=d_ids))
+                                      unit=str(d.get("unit") or m.get("unit") or ""), claim_ids=d_ids))
     series.sort(key=lambda x: x.year)
     kg.market = MarketSize(
         tam=_num(m.get("tam")), sam=_num(m.get("sam")), som=_num(m.get("som")),
-        unit=str(m.get("unit", "USD bn")), cagr_pct=_num(m.get("cagr_pct")),
+        unit=str(m.get("unit") or ""), cagr_pct=_num(m.get("cagr_pct")),
         series=series, claim_ids=m_ids,
     )
 
@@ -228,8 +237,9 @@ async def build_report_kg(topic: str, verified: list[Claim], llm) -> ReportKnowl
     return kg
 
 
-def _num(v) -> float | None:
+def _num(v) -> Decimal | None:
     try:
-        return float(v) if v is not None else None
-    except (TypeError, ValueError):
+        value = Decimal(str(v)) if v is not None else None
+        return value if value is not None and value.is_finite() else None
+    except (TypeError, ValueError, ArithmeticError):
         return None

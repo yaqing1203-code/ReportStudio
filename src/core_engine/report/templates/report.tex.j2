@@ -41,6 +41,7 @@
 \usetikzlibrary{arrows.meta, positioning, shapes.geometric, fit, backgrounds}
 \usepackage{pgfplots}
 \pgfplotsset{compat=1.17}
+\usepackage{xurl}
 \usepackage{hyperref}
 \usepackage{enumitem}
 
@@ -60,7 +61,7 @@
 %% --- Running header / footer -------------------------------------------------
 \pagestyle{fancy}
 \fancyhf{}
-\fancyhead[L]{\small\color{accent}<< title | tex | truncate(60) >>}
+\fancyhead[L]{\small\color{accent}<< title | truncate(60) | tex >>}
 \fancyhead[R]{\small\color{accent}\thepage}
 \renewcommand{\headrulewidth}{0.4pt}
 \renewcommand{\headrule}{\hbox to\headwidth{\color{accent}\leaders\hrule height \headrulewidth\hfill}}
@@ -71,52 +72,88 @@
 \begin{titlepage}
   \centering
   \vspace*{2cm}
-  {\color{accent}\large\scshape Research Report\par}
+  {\color{accent}\large\scshape << (("研究报告 · 待复核草稿" if quality_status == "needs_review" else "研究报告") if locale == "zh" else ("Research Report / Review Draft" if quality_status == "needs_review" else "Research Report")) | tex >>\par}
   \vspace{1.2cm}
   {\color{primary}\Huge\bfseries << title | tex >>\par}
   \vspace{0.6cm}
   {\color{accent}\rule{0.5\textwidth}{0.8pt}\par}
+<% if source_quality.evidence_mode == "limited_evidence" %>
+  \vspace{0.4cm}
+  {\color{primary}\large\bfseries << ("有限证据报告 · 尚未独立证实" if locale == "zh" else "Limited Evidence Report — Not Independently Confirmed") | tex >>\par}
+<% endif %>
   \vspace{1.5cm}
   \begin{minipage}{0.8\textwidth}
     \centering\itshape\large << abstract | tex >>
   \end{minipage}
   \vfill
   {\color{accent}\small Generated << generated_at | tex >> \\
-   Compiled from << source_count >> source(s): a mix of high-trust outlets
-   (government, research houses, industry institutions, non-profits, and
-   established media) and other public web sources.\par}
+   Compiled from << source_count >> source(s). See the source list and
+   evidence limitations for the actual coverage.\par}
   \vspace{1cm}
 \end{titlepage}
 
 %% --- Provenance notice -------------------------------------------------------
 \thispagestyle{fancy}
 \section*{Methodology \& Provenance}
-This report was assembled by an automated pipeline that gathered information from a
-broad mix of public sources. These range from high-trust outlets — government and
-inter-governmental bodies, investment-bank and research-house reports, recognised
-industry institutions, established non-profit research organisations, and mainstream
-media with editorial standards — through to other general web sources admitted for
-coverage. Sources are weighted by trust: findings endorsed by high-trust outlets or
-corroborated across multiple independent domains are reported as verified, while
-material resting on a single or lower-trust source is either labelled accordingly or
-separated into the \emph{Unverified Signals \& Rumors} section. Every verified
-finding below was cross-referenced across at least << min_sources >> independent
-domain(s) under the \emph{<< verify_mode | tex >>} verification contract
-(<< verify_rounds >> rounds). The structured sections (Industry Chain Map, Market
-Size, Competitive Landscape) are generated from a knowledge graph whose every node,
-edge, and figure traces back to a verified claim. Findings that could not be traced
-to any source were discarded and do not appear here.
+This report was assembled by an automated pipeline using << source_count >>
+source(s), listed in the bibliography. Source count does not establish diversity
+or independence; the evidence assessment records the access scope and limitations.
+The configured strategy is \emph{<< verify_strategy | tex >>}.
+<% if verify_strategy == "cross_reference" %>
+Claims were checked for source support under the \emph{<< verify_mode | tex >>}
+contract (up to << verify_rounds >> rounds). Confidence varies by claim; a
+high-trust source can qualify without independent corroboration. Agreement among
+sources is evidence of support, not proof that a statement is true.
+<% else %>
+Claims were accepted from extraction and screened for conflicts.
+<% if verify_strategy == "aligned" %>
+Entity alignment, source comparison and isolated-claim review add provenance signals.
+<% endif %>
+This strategy does not independently check every claim against its source text.
+Source authority and the absence of a detected conflict do not establish truth.
+<% endif %>
+The structured sections link their knowledge-graph elements to cited claims.
+Review the cited sources and any limitations before relying on the findings.
 
 \tableofcontents
 \newpage
 
+<% if quality_status != "not_audited" %>
+\section*{Sentence Evidence Audit}
+Status: \textbf{<< quality_status | tex >>}.
+<< grounding_audit.supported_sentences >> source-supported sentence(s);
+<< grounding_audit.withheld_sentences >> draft sentence(s) withheld for review.
+Source support does not establish factual truth or source independence.
+<% if grounding_audit.chart_blocks_requiring_review %>
+Some proposed charts/tables were withheld because numerical or scope validation failed.
+<% endif %>
+<% endif %>
+
+<% if source_quality.evidence_mode == "limited_evidence" %>
+\section*{<< ("有限证据报告" if locale == "zh" else "Limited Evidence Report") | tex >>}
+<< ("现有资料未达到通常的来源数量或论点数量要求。本报告只保留能定位原文的说法，不代表已获得独立证实。缺失数据和未回答的问题仍须补证；摘要、预印本、材料或小电池实验不能证明量产、整电池性能或商业化。" if locale == "zh" else "Available evidence falls below the usual source or claim count. Only source-bound statements are retained; they are not independently confirmed. Gaps remain open. Abstracts, preprints and materials/coin-cell tests do not establish commercial or full-cell performance.") | tex >>
+<% endif %>
+
 %% --- Body: the 5 mandated sections; prose, KG-driven charts, then deep dives --
 <% for section in sections %>
 \section{<< section.heading | tex >>}
+<% set visible_sentences = section.sentences | rejectattr("status", "equalto", "withheld") | list %>
+<% if visible_sentences %>
+<% for sentence in visible_sentences %>
+<% if source_quality.evidence_mode == "limited_evidence" and sentence.status == "supported" and not sentence.attribution %>
+\emph{<< ("来源报告（未独立证实）：" if locale == "zh" else "Source-reported (not independently confirmed): ") | tex >>}
+<% endif %>
+<< sentence.attribution | tex >><< sentence.text | tex >><% for eid in sentence.citation_ids %> \allowbreak{}\hyperref[ev:<< eid | tex >>]{[<< eid | tex >>]}<% endfor %>
+
+<% endfor %>
+<% elif not section.sentences and section.paragraphs %>
 <% for para in section.paragraphs %>
 << para | tex >>
 
 <% endfor %>
+<% elif not section.latex_blocks and not section.deep_dives %>
+<< ("本节暂无足够的原文支持内容。" if locale == "zh" else "This section has no sufficiently supported content yet.") | tex >>
+<% endif %>
 <% for block in section.latex_blocks %>
 %% chart/table block — figure floats [H] so long sections don't push it adrift
 \begin{figure}[H]
@@ -129,37 +166,250 @@ to any source were discarded and do not appear here.
 %% Deep-dive analytical insights (multi-paragraph, grounded in verified claims)
 <% for dive in section.deep_dives %>
 \subsection{<< dive.title | tex >>}
+<% set visible_dive_sentences = dive.sentences | rejectattr("status", "equalto", "withheld") | list %>
+<% if visible_dive_sentences %>
+<% for sentence in visible_dive_sentences %>
+<< sentence.attribution | tex >><< sentence.text | tex >><% for eid in sentence.citation_ids %> \allowbreak{}\hyperref[ev:<< eid | tex >>]{[<< eid | tex >>]}<% endfor %>
+
+<% endfor %>
+<% elif not dive.sentences and dive.paragraphs %>
 <% for para in dive.paragraphs %>
 << para | tex >>
 
 <% endfor %>
+<% else %>
+<< ("本节暂无足够的原文支持内容。" if locale == "zh" else "This section has no sufficiently supported content yet.") | tex >>
+<% endif %>
 <% endfor %>
 <% endif %>
 <% endfor %>
 
+<% if scientific_audit and scientific_audit.observations %>
+\section{<< ("实验观测与可比性边界" if locale == "zh" else "Experimental Observations and Comparability") | tex >>}
+<< ("以下数值均保留来源证据。缺失条件保持未知。带 M 编号的条件可以跳转到同篇论文的方法原文。比较结论仅适用于已记录的样品、测量边界和实验条件。" if locale == "zh" else "Each observation retains source evidence. Missing conditions remain unknown. Conditions marked with an M identifier link to a Methods passage in the same paper. Comparisons apply to the recorded specimens, measurement boundaries and test conditions.") | tex >>
+{\footnotesize
+\setlength{\tabcolsep}{3pt}
+\begin{longtable}{>{\raggedright\arraybackslash}p{0.22\linewidth}>{\raggedright\arraybackslash}p{0.14\linewidth}>{\raggedright\arraybackslash}p{0.32\linewidth}>{\raggedright\arraybackslash}p{0.23\linewidth}}
+\toprule
+<< ("样品与指标" if locale == "zh" else "Specimen / metric") | tex >> & << ("观测值" if locale == "zh" else "Observation") | tex >> & << ("明确条件" if locale == "zh" else "Explicit conditions") | tex >> & << ("比较所缺条件" if locale == "zh" else "Missing comparison conditions") | tex >> \\
+\midrule
+\endhead
+<% for row in scientific_audit.observations %>
+<< (row.entity or "unknown") | truncate(110) | tex >>\par << row.name | replace("_", " ") | tex >>
+<% for eid in row.evidence_ids %> \allowbreak{}\hyperref[ev:<< eid | tex >>]{[<< eid | tex >>]}<% endfor %>
+& << row.value | tex >> << row.unit | tex >>
+& << (row.boundary or ("边界未报告" if locale == "zh" else "Boundary not reported")) | tex >>
+<% set method_refs = row.method_ids | default({}) %>
+<% for key, value in row.conditions.items() if value %>\par << key | replace("_", " ") | tex >> << value | tex >><% if key in method_refs %> \allowbreak{}\hyperref[methods:<< method_refs[key] | tex >>]{[<< method_refs[key] | tex >>]}<% endif %><% endfor %>
+& << (row.missing_labels | join("; ") if row.missing_labels else ("所列条件齐全" if locale == "zh" else "Recorded conditions complete")) | tex >> \\
+\midrule
+<% endfor %>
+\bottomrule
+\end{longtable}
+}
+<% if scientific_audit.methods %>
+\subsection{<< ("实验方法原文" if locale == "zh" else "Methods Passages") | tex >>}
+<% for witness in scientific_audit.methods %>
+\par\phantomsection\label{methods:<< witness.id | tex >>}\textbf{<< witness.id | tex >>}
+<< witness.locator.section_title | default("") | tex >>
+<< ("字符范围" if locale == "zh" else "Character range") | tex >> [<< witness.start >>, << witness.end >>)\\
+\url{<< witness.source_url | tex_url >>}
+\begin{quote}
+<< witness.quote | tex_quote >>
+\end{quote}
+<% endfor %>
+<% endif %>
+<% endif %>
+
 %% --- Unverified signals & rumors (single-source, uncorroborated) -------------
 %% Kept per the broad-collection model, but clearly separated from verified facts.
 <% if rumors %>
-\newpage
+\par\bigskip
+<% if locale == "zh" %>
+\section{待复核的来源陈述}
+\emph{以下陈述有可定位的来源原文，尚未满足通常的交叉核验要求。请结合来源等级、实验条件和逐句证据复核；原文支持不等于事实已经独立证实。}
+<% else %>
 \section{Unverified Signals \& Rumors}
-\addcontentsline{toc}{section}{Unverified Signals \& Rumors}
 \emph{The items below come from a single source and were \textbf{not} corroborated by
 independent or high-trust outlets. They are included as early signals and should be
 treated as unverified — they are excluded from the verified analysis and charts above.}
+<% endif %>
 
 \begin{itemize}[leftmargin=1.4em]
-<% for r in rumors %>
-  \item << r.text | tex >>~\textsuperscript{[unverified]}
+<% for r in rumor_sentences if r.status == "supported" %>
+  \item{} << r.text | replace("[UNVERIFIED - single source]", "") | trim | tex >>~\textsuperscript{[<< ("待复核" if locale == "zh" else "unverified") | tex >>]}<% for eid in r.citation_ids %> \allowbreak{}\hyperref[ev:<< eid | tex >>]{[<< eid | tex >>]}<% endfor %>
 <% endfor %>
 \end{itemize}
+<% endif %>
+
+<% if dispute_sentences %>
+\section{<< ("来源分歧与暂缓结论" if locale == "zh" else "Source Disagreements and Withheld Conclusions") | tex >>}
+<< ("以下陈述在当前记录的口径下存在尚未解决的分歧，条件完整性仍须复核。分别展示双方原文支持的说法，暂不选定结论，也不用于指标计算或图表。" if locale == "zh" else "These source statements have unresolved differences under their recorded scope; completeness of conditions needs review. Both are shown; no settled conclusion, calculation or chart is drawn from them.") | tex >>
+\begin{itemize}[leftmargin=1.4em]
+<% for sentence in dispute_sentences if sentence.status == "supported" %>
+\item{} << sentence.attribution | tex >><< sentence.text | tex >><% for eid in sentence.citation_ids %> \allowbreak{}\hyperref[ev:<< eid | tex >>]{[<< eid | tex >>]}<% endfor %>
+<% endfor %>
+\end{itemize}
+<% endif %>
+
+<% if leads %>
+\section{<< ("待核验线索（不作为结论）" if locale == "zh" else "Unverified Leads (Not Conclusions)") | tex >>}
+<< ("以下仅为抽取到的候选，尚未找到支持整条陈述的可定位原文；不是事实陈述，不计入问题覆盖，不用于分析或计算。" if locale == "zh" else "These retained candidates lack a located passage supporting the complete assertion. They do not count toward coverage and are excluded from analysis and calculation.") | tex >>
+\begin{itemize}[leftmargin=1.4em]
+<% for lead in leads %>\item{} << lead.claim_id | tex >>: << lead.text | tex >><% endfor %>
+\end{itemize}
+<% endif %>
+
+<% if source_quality.claims %>
+\section*{<< ("证据强度与适用边界" if locale == "zh" else "Evidence Strength and Limits") | tex >>}
+<< ("原文支持、研究是否经过评审、不同来源是否独立、结果是否被复现是不同问题；本报告不提供真实性概率。" if locale == "zh" else "Source support, peer review, independent origins and replicated results are distinct questions. No truth probability is assigned.") | tex >>
+<% set caveat_labels = {"single_origin_not_independently_confirmed":"单一信息源，尚无独立证实", "same_work_or_republication_not_additional_corroboration":"同一研究或转载，不能重复算作佐证", "abstract_only_methods_and_full_results_not_checked":"仅取得摘要，未检查全文方法与完整结果", "aggregated_abstract_original_publication_not_directly_checked":"聚合平台摘要，尚未直接核对原始出版物", "preprint_peer_review_not_established":"预印本，未确认同行评审", "interested_party_self_report":"利益相关方自述"} if locale == "zh" else {} %>
+<% for cid, quality in source_quality.claims.items() if quality.source_support == "anchored" %>
+\par\textbf{<< cid | tex >>}: << ("可追溯来源组：" if locale == "zh" else "Traceable origin groups: ") | tex >><< quality.origin_group_count >>;
+<% for caveat in quality.caveats %><< caveat_labels.get(caveat, caveat) | tex >>; <% endfor %>
+<% if quality.model_review_flags %><< ("自动检查提出了待核对点，尚未据此判真伪。" if locale == "zh" else "Automated review raised attention flags; these are not truth verdicts.") | tex >><% endif %>
+<% endfor %>
+<% endif %>
+
+<% if research_plan %>
+<% set coverage_labels = {"supported":"已有原文支持", "partial":"部分覆盖", "missing":"缺少证据", "undetermined":"尚不能确定"} if locale == "zh" else {} %>
+<% set stop_labels = {"questions_covered":"已覆盖计划问题", "document_only":"仅使用已提供文档", "retrieval_disabled":"未启用补检索", "query_budget":"已达到查询上限", "source_budget":"已达到资料上限", "no_new_queries":"暂无未执行查询", "no_new_sources":"未获取新资料", "no_new_evidence":"新资料未增加有效证据", "round_budget":"已达到轮次上限", "deadline":"已达到时间上限", "retrieval_error":"补检索失败，保留已有证据", "not_started":"尚未完成"} if locale == "zh" else {} %>
+\phantomsection
+\section*{<< ("研究问题与证据缺口" if locale == "zh" else "Research Questions and Evidence Gaps") | tex >>}
+\addcontentsline{toc}{section}{<< ("研究问题与证据缺口" if locale == "zh" else "Research Questions and Evidence Gaps") | tex >>}
+<< ("研究目标：" if locale == "zh" else "Objective: ") | tex >><< research_plan.objective | tex >>
+\begin{description}[style=nextline]
+<% for question in research_plan.questions %>
+\item[<< question.id | tex >>] << question.question | tex >>\\
+<% for assessment in research_audit.questions if assessment.id == question.id %>
+<< ("证据要求：" if locale == "zh" else "Evidence needed: ") | tex >><< (assessment.assessment_criteria | default(question.evidence_needed)) | tex >>
+\\<< ("覆盖状态：" if locale == "zh" else "Coverage: ") | tex >><< coverage_labels.get(assessment.status, assessment.status) | tex >>.
+<% if assessment.missing %><< assessment.missing | join(", ") | tex >><% endif %>
+<% for eid in assessment.citation_ids %> \allowbreak{}\hyperref[res:<< eid | tex >>]{[<< eid | tex >>]}<% endfor %>
+<% endfor %>
+<% endfor %>
+\end{description}
+<< ("补检索停止原因：" if locale == "zh" else "Retrieval stop reason: ") | tex >><< stop_labels.get(research_audit.stop_reason, research_audit.stop_reason) | tex >>.
+<% for search in research_audit.searches %>
+\par << search.question_id | tex >>: << search.gap | tex >>;
+\emph{<< search.query | tex >>}; << search.status | tex >>.
+<% endfor %>
+<% endif %>
+
+<% if analysis %>
+<% set analysis_labels = {"interpretation":"基于证据的解释", "causal_hypothesis":"因果假设", "scenario":"条件情景"} if locale == "zh" else {} %>
+<% set counter_labels = {"selected_grounded_counterevidence":"已选用有原文支持的反证", "searched_but_no_counterevidence_selected":"已检索，但本条判断未选用反证", "not_searched":"未完成反证检索"} if locale == "zh" else {} %>
+\par\bigskip
+\section*{<< ("分析判断（需要人工复核）" if locale == "zh" else "Analytical Judgments (Human Review Required)") | tex >>}
+\phantomsection
+\addcontentsline{toc}{section}{<< ("分析判断" if locale == "zh" else "Analytical Judgments") | tex >>}
+<< ("下列内容是根据已引用观察作出的有限推论，不是原文事实，也不是已证实的因果结论。" if locale == "zh" else "These are bounded inferences from cited observations, not source assertions or established causal conclusions.") | tex >>
+<% for finding in analysis %>
+\subsection*{<< finding.id | tex >>: << analysis_labels.get(finding.kind, finding.kind) | tex >>}
+<< finding.conclusion | tex >>
+<% for eid in finding.citation_ids %> \allowbreak{}\hyperref[res:<< eid | tex >>]{[<< eid | tex >>]}<% endfor %>
+\par << ("假设：" if locale == "zh" else "Assumptions: ") | tex >><< finding.assumptions | join("; ") | tex >>
+\par << ("替代解释：" if locale == "zh" else "Alternative explanations: ") | tex >><< finding.alternatives | join("; ") | tex >>
+\par << ("不确定性：" if locale == "zh" else "Uncertainty: ") | tex >><< finding.uncertainty | tex >>
+\par << ("反证选择状态：" if locale == "zh" else "Counterevidence selection: ") | tex >><< counter_labels.get(finding.counterevidence_status, finding.counterevidence_status) | tex >>.
+<% for calc in finding.calculation_ids %> \allowbreak{}\hyperref[calc:<< calc | tex >>]{[<< calc | tex >>]}<% endfor %>
+<% endfor %>
+<% endif %>
+
+<% if chart_audit %>
+\section*{Chart Validation}
+<% for entry in chart_audit %>
+\textbf{<< entry.block | tex >>}: << entry.status | tex >>.
+<< entry.reason | tex >>
+<% for eid in entry.evidence_ids %>
+ \allowbreak{}\hyperref[ev:<< eid | tex >>]{[<< eid | tex >>]}
+<% endfor %>
+<% for context in entry.context %>
+Entity: << (context.entity or "unknown") | tex >>;
+period: << (context.period or "unknown") | tex >>;
+geography: << (context.geography or "unknown") | tex >>;
+scope: << (context.scope or "unknown") | tex >>;
+price basis: << (context.price_basis or "n/a") | tex >>;
+rate basis: << (context.rate_basis or "n/a") | tex >>;
+kind: << (context.value_kind or "unknown") | tex >>;
+unit: << context.unit | tex >>.
+<% endfor %>
+
+<% endfor %>
+<% endif %>
+
+<% if calculations %>
+\newpage
+\section*{Deterministic Calculations}
+\phantomsection
+\addcontentsline{toc}{section}{Deterministic Calculations}
+Results below are calculated by code from source-backed metric inputs, not drafted by the model.
+<% for calculation in calculations %>
+\subsection*{<< calculation.id | tex >>: << calculation.operation | tex >>}
+\phantomsection\label{calc:<< calculation.id | tex >>}
+<% for input in calculation.inputs %>
+Input << input.id | tex >>: << input.value | tex >> << input.unit | tex >>.\\
+<% endfor %>
+Result: << calculation.value | tex >> << calculation.unit | tex >>;
+period: << (calculation.period or "unknown") | tex >>.\\
+Formula: << calculation.formula | tex >>.\\
+Precision: << calculation.precision >>; rounding: << calculation.rounding | tex >>;
+quantum: << (calculation.quantum or "exact unit conversion") | tex >>.
+<% for eid in calculation.evidence_ids %>
+ \allowbreak{}\hyperref[ev:<< eid | tex >>]{[<< eid | tex >>]}
+<% endfor %>
+
+<% endfor %>
+<% endif %>
+
+<% if citations %>
+\newpage
+\section*{Sentence Evidence}
+\phantomsection
+\addcontentsline{toc}{section}{Sentence Evidence}
+The quotations below refer to the exact extracted source snapshots retained in the
+companion evidence JSON. Character offsets are zero-based; the end offset is exclusive.
+<% for evidence in citations %>
+<% if evidence.quote | length < 1600 %>\begin{samepage}<% endif %>
+\subsection*{<< evidence.id | tex >> --- << evidence.claim_id | tex >>}
+\phantomsection\label{ev:<< evidence.id | tex >>}
+\begin{quote}<< evidence.quote | tex_quote >>\end{quote}
+\url{<< evidence.source_url | tex_url >>}\\
+<% if evidence.page %>Page << evidence.page >>; <% endif %>
+paragraph << evidence.paragraph >>; characters << evidence.start_char >>--<< evidence.end_char >>.\\
+Method: << evidence.method | tex >>. Snapshot SHA-256:\\
+{\small\texttt{<% for chunk in evidence.source_sha256 | batch(8) %><< chunk | join | tex >><% if not loop.last %>\allowbreak{}<% endif %><% endfor %>}}.\par
+<% set snapshot = source_by_url[evidence.source_url] %>
+Published: << (snapshot.published_at or "unknown") | tex >>;
+captured: << snapshot.fetched_at | tex >>.\par
+<% if evidence.quote | length < 1600 %>\end{samepage}<% endif %>
+<% endfor %>
+<% endif %>
+
+<% if research_evidence.citations %>
+\newpage
+\section*{<< ("研究与分析证据" if locale == "zh" else "Research and Analysis Evidence") | tex >>}
+<% for evidence in research_evidence.citations %>
+<% if evidence.quote | length < 1600 %>\begin{samepage}<% endif %>
+\subsection*{<< evidence.id | tex >> --- << evidence.claim_id | tex >>}
+\phantomsection\label{res:<< evidence.id | tex >>}
+\begin{quote}<< evidence.quote | tex_quote >>\end{quote}
+\url{<< evidence.source_url | tex_url >>}\\
+Characters << evidence.start_char >>--<< evidence.end_char >>;
+<% if evidence.page %>page << evidence.page >>; <% endif %>
+SHA-256:\\
+{\small\texttt{<% for chunk in evidence.source_sha256 | batch(8) %><< chunk | join | tex >><% if not loop.last %>\allowbreak{}<% endif %><% endfor %>}}.\par
+<% if evidence.quote | length < 1600 %>\end{samepage}<% endif %>
+<% endfor %>
 <% endif %>
 
 %% --- Sources / bibliography -------------------------------------------------
 \newpage
 \section*{Sources}
+\phantomsection
 \addcontentsline{toc}{section}{Sources}
-The sources cited below span high-trust outlets and other public web sources; each
-was screened against the source filter before use.
+The source snapshots used in this report are listed below. Inclusion does not
+establish independent confirmation, peer review or access to the full text.
 
 \begin{longtable}{@{}p{0.34\textwidth}p{0.60\textwidth}@{}}
 \toprule
@@ -167,7 +417,9 @@ was screened against the source filter before use.
 \midrule
 \endhead
 <% for src in sources %>
-<< src.domain | tex >> & << src.title | tex >>\newline \url{<< src.url >>} \\
+<< src.domain | tex >> & << src.title | tex >>\newline \url{<< src.url | tex_url >>}
+<% if source_attribution[src.url].authors %>\newline << source_attribution[src.url].authors | join(", ") | tex >><% endif %>
+<% for license in source_attribution[src.url].licenses %>\newline \url{<< license | tex_url >>}<% endfor %> \\
 \addlinespace
 <% endfor %>
 \bottomrule

@@ -147,7 +147,7 @@ async def test_comprehensive_from_injected_sources_only(monkeypatch):
     docs = [
         Source("userdoc://s/a1", "user-document-a1", "User Doc 1",
                SourceKind.USER_PROVIDED,
-               text="The global market grew to 50 billion dollars in 2024. "
+               text="The global solar cell market grew to 50 billion dollars in 2024. "
                     "Adoption increased across three regions."),
         Source("userdoc://s/a2", "user-document-a2", "User Doc 2",
                SourceKind.USER_PROVIDED,
