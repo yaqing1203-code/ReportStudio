@@ -72,6 +72,7 @@ ignore = [
 ]
 
 [tool.pytest.ini_options]
+pythonpath = ["."]
 # Tests use the anyio pytest plugin (ships with anyio), not pytest-asyncio.
 # Async tests are marked with `pytestmark = pytest.mark.anyio`.
 
